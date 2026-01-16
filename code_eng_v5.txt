@@ -1,0 +1,171 @@
+import win32com.client
+import os
+import shutil
+import pandas as pd
+import pythoncom
+
+# --- Configuration ---
+# ⚠️ Update Account Name
+TARGET_ACCOUNT_NAME = "data.team@rbc.com"
+
+# File Paths
+CONFIG_FILE_PATH = r"C:\Work\config.xlsx"   
+TEMP_FOLDER = r"C:\temp3"                   # Temp download folder
+DEFAULT_FOLDER = r"C:\temp4"                # Default folder (if subject matches but no specific rule fits)
+
+# Ensure directories exist
+for f in [TEMP_FOLDER, DEFAULT_FOLDER]:
+    os.makedirs(f, exist_ok=True)
+
+def get_target_inbox(account_name):
+    """
+    Connects to Outlook and returns the Inbox folder for the specified account.
+    """
+    pythoncom.CoInitialize()
+    outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    
+    for folder in outlook.Folders:
+        if folder.Name.lower() == account_name.lower():
+            try:
+                return folder.Folders("Inbox")
+            except:
+                try:
+                    return folder.Folders("收件箱")
+                except:
+                    return None
+    return None
+
+def load_config_rules():
+    """
+    Reads the Excel config with columns:
+    [Subject_Keyword, Attachment_Keyword, File_Extension, Destination_Folder]
+    """
+    try:
+        df = pd.read_excel(CONFIG_FILE_PATH)
+        # Fill NaN values with empty strings
+        df.fillna("", inplace=True)
+        # Ensure all columns exist to prevent KeyError
+        expected_cols = ['Subject_Keyword', 'Attachment_Keyword', 'File_Extension', 'Destination_Folder']
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = "" # Create empty column if missing
+                
+        rules = df.to_dict('records')
+        print(f"📋 Loaded {len(rules)} rules from Excel.")
+        return rules
+    except Exception as e:
+        print(f"❌ Error reading config excel: {e}")
+        return []
+
+def process_attachments(msg, rules):
+    """
+    Loop through attachments, check against rules (including extension), and move.
+    """
+    if msg.Attachments.Count == 0:
+        print("   (No attachments in this email)")
+        return
+
+    for i in range(1, msg.Attachments.Count + 1):
+        attachment = msg.Attachments.Item(i)
+        filename = attachment.FileName
+        
+        # 1. Save to Temp (C:\temp3)
+        temp_path = os.path.join(TEMP_FOLDER, filename)
+        try:
+            attachment.SaveAsFile(temp_path)
+        except Exception as e:
+            print(f"   ❌ Save Error ({filename}): {e}")
+            continue
+
+        # 2. Match Rules
+        destination = DEFAULT_FOLDER # Default to C:\temp4
+        matched_rule_info = "Default (No specific match)"
+
+        for rule in rules:
+            # Prepare keywords (lowercase for comparison)
+            r_subj = str(rule.get('Subject_Keyword', '')).strip().lower()
+            r_att  = str(rule.get('Attachment_Keyword', '')).strip().lower()
+            r_ext  = str(rule.get('File_Extension', '')).strip().lower() # New Column
+            r_dest = rule.get('Destination_Folder')
+
+            # --- Logic Check ---
+            # 1. Subject Match
+            match_subject = r_subj in msg.Subject.lower()
+            
+            # 2. Filename Keyword Match
+            match_filename = r_att in filename.lower()
+            
+            # 3. Extension Match (Handle empty extension case)
+            if r_ext:
+                # If rule has extension (e.g. ".pdf"), file must end with it
+                match_ext = filename.lower().endswith(r_ext)
+            else:
+                # If rule extension is empty, ignore this check (Always True)
+                match_ext = True
+
+            # If ALL conditions pass
+            if match_subject and match_filename and match_ext:
+                destination = r_dest
+                matched_rule_info = f"Rule: Subj='{r_subj}', Ext='{r_ext}'"
+                break # Stop searching rules for this file
+
+        # 3. Move File
+        try:
+            os.makedirs(destination, exist_ok=True)
+            final_path = os.path.join(destination, filename)
+            shutil.move(temp_path, final_path)
+            print(f"   ✅ Moved: {filename} -> {destination} [{matched_rule_info}]")
+        except Exception as e:
+            print(f"   ❌ Move Error: {e}")
+
+def run_email_processor():
+    print("🚀 Starting Email Processor (v3: Configurable Extension + Force Read)...")
+    
+    rules = load_config_rules()
+    if not rules: return
+
+    inbox = get_target_inbox(TARGET_ACCOUNT_NAME)
+    if not inbox: 
+        print(f"❌ Cannot access Inbox for {TARGET_ACCOUNT_NAME}")
+        return
+
+    # Get Unread Emails
+    items = inbox.Items.Restrict("[UnRead] = True")
+    items.Sort("[ReceivedTime]", True) 
+
+    print(f"🔍 Found {items.Count} unread emails.")
+
+    processed_count = 0
+    
+    # Using list() to safely iterate while modifying properties
+    for msg in list(items):
+        try:
+            # --- Step 1: Check if Subject is relevant ---
+            is_relevant = False
+            for rule in rules:
+                rule_subj = str(rule.get('Subject_Keyword', '')).strip().lower()
+                if rule_subj and rule_subj in msg.Subject.lower():
+                    is_relevant = True
+                    break
+            
+            if not is_relevant:
+                # Skip email completely (Subject not in Excel)
+                continue
+
+            # --- Step 2: Process Attachments ---
+            print(f"📧 Processing Relevant Email: {msg.Subject}")
+            process_attachments(msg, rules)
+            
+            # --- Step 3: Force Mark as Read (As requested) ---
+            # 因為已經確定是 "Relevant Subject"，所以無論附件結果如何，都 Mark Read
+            msg.UnRead = False
+            processed_count += 1
+            print("   ✨ Marked as Read.")
+
+        except Exception as e:
+            print(f"⚠️ Error processing email: {e}")
+
+    print(f"🏁 Finished. Processed {processed_count} emails.")
+
+if __name__ == "__main__":
+    run_email_processor()
