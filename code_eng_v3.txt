@@ -1,0 +1,75 @@
+# --- 設定 ---
+# ⚠️ 請將這裡改成你在 Checkpoint 1 見到的準確名稱
+TARGET_ACCOUNT_NAME = "data.team@rbc.com" 
+
+import win32com.client
+
+# 1. 連接 Outlook
+outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+print("--- 檢查點 1: 列出所有 Outlook 帳號 ---")
+# Loop 晒所有 Root Folders (即係帳號) 出黎睇
+found_accounts = []
+for folder in outlook.Folders:
+    print(f"發現帳號 (Folder Name): '{folder.Name}'")
+    found_accounts.append(folder.Name)
+
+print("---------------------------------------")
+
+print(f"\n--- 檢查點 2: 嘗試進入 '{TARGET_ACCOUNT_NAME}' ---")
+
+target_folder = None
+target_inbox = None
+
+# 1. 再次 Loop 搵番個目標 Account Object
+for folder in outlook.Folders:
+    if folder.Name == TARGET_ACCOUNT_NAME:
+        target_folder = folder
+        break
+
+if target_folder:
+    print("✅ 成功搵到 Account Object!")
+    
+    # 2. 列出該 Account 下面的頭 5 個 Folder，確認有無 Inbox
+    print(f"'{TARGET_ACCOUNT_NAME}' 下面的 Folder 有:")
+    for f in target_folder.Folders:
+        print(f" - {f.Name}")
+        
+    # 3. 嘗試鎖定 Inbox
+    try:
+        # 如果你係中文 Outlook，這裡可能要改成 "收件箱"
+        target_inbox = target_folder.Folders("Inbox") 
+        print(f"✅ 成功鎖定 Inbox! 裡面總共有 {target_inbox.Items.Count} 封郵件。")
+    except Exception as e:
+        print(f"❌ 搵唔到 'Inbox' Folder! Error: {e}")
+else:
+    print(f"❌ 搵唔到名為 '{TARGET_ACCOUNT_NAME}' 的 Account，請檢查 Checkpoint 1 的結果。")
+
+
+print("\n--- 檢查點 3: 讀取 Inbox 最新 3 封信 (測試權限) ---")
+
+if target_inbox:
+    # 按照接收時間排序 (最後收到的在最尾)
+    messages = target_inbox.Items
+    messages.Sort("[ReceivedTime]", True) # True = Descending (最新的在最前)
+
+    print(f"正在讀取最新的 3 封信...")
+    
+    # 讀頭 3 封
+    # 注意：Item index 在 Outlook 是從 1 開始，不是 0
+    # 為了安全，我們檢查 count 先
+    limit = min(3, messages.Count)
+    
+    for i in range(1, limit + 1):
+        try:
+            msg = messages.Item(i)
+            print(f"[{i}] 時間: {msg.ReceivedTime} | 標題: {msg.Subject} | 寄件者: {msg.SenderName}")
+            print(f"    - 未讀狀態: {msg.UnRead}")
+            print(f"    - 附件數量: {msg.Attachments.Count}")
+        except Exception as e:
+            print(f"[{i}] 讀取錯誤 (可能是 Meeting Invite 或非 Email 物件): {e}")
+
+else:
+    print("❌ 因為 Checkpoint 2 失敗，無法讀取郵件。")
+
+
