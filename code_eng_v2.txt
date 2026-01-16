@@ -1,0 +1,132 @@
+import win32com.client
+import os
+import shutil
+import pandas as pd
+from datetime import datetime
+
+# --- Configuration ---
+# ⚠️ UPDATE THIS: The exact email address/account name found in Step 1
+TARGET_ACCOUNT_EMAIL = "data.team@rbc.com" 
+
+CONFIG_FILE_PATH = r"C:\Work\config.xlsx"   # Path to Excel config
+TEMP_FOLDER = r"C:\Work\Temp"               # Temp folder
+DEFAULT_FOLDER = r"C:\Work\Unsorted"        # Default destination
+TARGET_SUBJECT = "TRIGGER_ME"               # Trigger keyword
+
+# Ensure directories exist
+for f in [TEMP_FOLDER, DEFAULT_FOLDER]:
+    os.makedirs(f, exist_ok=True)
+
+def get_inbox_by_account(target_email):
+    """
+    Loops through all Outlook root folders to find the specific account,
+    then returns its 'Inbox' folder.
+    """
+    outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    
+    target_folder = None
+    
+    # Iterate through all accounts (root folders)
+    for folder in outlook.Folders:
+        # Case-insensitive comparison
+        if folder.Name.lower() == target_email.lower():
+            target_folder = folder
+            break
+            
+    if not target_folder:
+        print(f"❌ Could not find account: {target_email}")
+        print("Available accounts are:")
+        for f in outlook.Folders:
+            print(f" - {f.Name}")
+        return None
+    
+    try:
+        # Usually the folder is named "Inbox". 
+        # Note: If your Outlook is in Chinese, this might need to be "收件箱"
+        inbox = target_folder.Folders("Inbox")
+        return inbox
+    except Exception as e:
+        print(f"❌ Account found, but could not find 'Inbox' folder: {e}")
+        return None
+
+def load_config_rules():
+    """
+    Reads the Excel configuration file.
+    """
+    try:
+        df = pd.read_excel(CONFIG_FILE_PATH)
+        rules = df.to_dict('records')
+        print(f"📋 Loaded {len(rules)} rules from Excel.")
+        return rules
+    except Exception as e:
+        print(f"❌ Error reading config excel: {e}")
+        return []
+
+def main():
+    print("🚀 Starting Manual Outlook Processor...")
+
+    # 1. Get the specific Inbox
+    inbox = get_inbox_by_account(TARGET_ACCOUNT_EMAIL)
+    
+    if not inbox:
+        print("Exiting...")
+        return
+
+    # 2. Load Rules
+    rules = load_config_rules()
+    if not rules:
+        print("No rules loaded. Exiting...")
+        return
+
+    # 3. Find emails in that specific Inbox
+    print(f"🔍 Scanning Inbox of: {TARGET_ACCOUNT_EMAIL}")
+    messages = inbox.Items.Restrict(f"[UnRead] = True AND [Subject] = '{TARGET_SUBJECT}'")
+    
+    # 4. Process Loop
+    count = 0
+    for msg in list(messages):
+        print(f"📧 Processing Email: {msg.Subject}")
+        
+        if msg.Attachments.Count > 0:
+            for i in range(1, msg.Attachments.Count + 1):
+                attachment = msg.Attachments.Item(i)
+                filename = attachment.FileName
+                print(f"   📎 Found file: {filename}")
+                
+                # Save to Temp
+                temp_path = os.path.join(TEMP_FOLDER, filename)
+                attachment.SaveAsFile(temp_path)
+                
+                # Check Rules
+                destination = DEFAULT_FOLDER
+                matched = False
+                
+                for rule in rules:
+                    if str(rule.get('Keyword', '')).lower() in filename.lower():
+                        destination = rule.get('Destination_Folder')
+                        matched = True
+                        print(f"   ✅ Matched Rule: {rule.get('Keyword')} -> {destination}")
+                        break
+                
+                # Move File
+                try:
+                    os.makedirs(destination, exist_ok=True)
+                    final_path = os.path.join(destination, filename)
+                    shutil.move(temp_path, final_path)
+                    print(f"   🚚 Moved to: {final_path}")
+                except Exception as e:
+                    print(f"   ❌ Move failed: {e}")
+        else:
+            print("   (No attachments found)")
+
+        # 5. Mark as Read (Crucial to prevent re-reading)
+        msg.UnRead = False
+        count += 1
+        
+    if count == 0:
+        print("💤 No matching unread emails found.")
+    else:
+        print(f"✨ Finished processing {count} emails.")
+
+if __name__ == "__main__":
+    main()

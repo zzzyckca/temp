@@ -1,0 +1,7 @@
+import win32com.client
+
+outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+print("--- Listing all accounts in Outlook ---")
+for folder in outlook.Folders:
+    print(f"Account Name: {folder.Name}")
