@@ -4,24 +4,22 @@ import shutil
 import pandas as pd
 import pythoncom
 from datetime import datetime
-from prefect import flow  # Prefect Core Import
 
 # ==========================================
 # 1. CONFIGURATION & SETUP
 # ==========================================
-# The display name of the target Outlook account. 
-# MUST match exactly what you see in Outlook (e.g., 'Data Team' or 'data.team@rbc.com')
+# The specific account to monitor. Must match the Outlook display name exactly.
 TARGET_ACCOUNT_NAME = "data.team@rbc.com"
 
 # Local File System Paths
 CONFIG_FILE_PATH = r"C:\Work\config.xlsx"   # Excel rule file
-TEMP_FOLDER = r"C:\temp3"                   # Staging folder for downloading attachments
-DEFAULT_FOLDER = r"C:\temp4"                # Fallback folder if no rules match
+TEMP_FOLDER = r"C:\temp3"                   # Staging area for downloads
+DEFAULT_FOLDER = r"C:\temp4"                # Fallback destination if no rule matches
 
 # Database Configuration
-# ⚠️ ACTION REQUIRED: Replace the string below with your actual SQLAlchemy engine object.
+# ⚠️ REPLACE THIS with your actual SQLAlchemy engine object before running
 # Example: create_engine('mssql+pyodbc://user:pwd@host/db?driver=ODBC+Driver+17+for+SQL+Server')
-create_engine = "TO BE ADDED" 
+create_engine = "REPLACE_WITH_REAL_ENGINE_OBJECT" 
 DB_TABLE_NAME = "Email_Automation_Logs"
 
 # Ensure all necessary local directories exist to prevent 'PathNotFound' errors
@@ -39,14 +37,12 @@ def get_target_inbox(account_name):
     for a specific account name.
     
     Args:
-        account_name (str): The display name of the email account.
+        account_name (str): The display name of the email account (e.g., 'data.team@rbc.com')
     
     Returns:
         Outlook.MAPIFolder: The Inbox folder object, or None if not found.
     """
-    # CRITICAL: Initialize COM library. 
-    # Prefect runs flows in separate threads/processes. win32com is sensitive to threading.
-    # Without this, you might get 'CoInitialize has not been called' errors.
+    # Initialize COM library. Critical for thread safety if this script is run via task scheduler or Prefect.
     pythoncom.CoInitialize()
     
     outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
@@ -56,8 +52,7 @@ def get_target_inbox(account_name):
         # Case-insensitive comparison for robustness
         if folder.Name.lower() == account_name.lower():
             try:
-                # Direct access to 'Inbox'. 
-                # Note: If using Chinese Outlook, change this to "收件箱"
+                # Direct access to 'Inbox' as requested (assuming English environment)
                 return folder.Folders("Inbox")
             except Exception as e:
                 print(f"❌ Account '{account_name}' found, but 'Inbox' folder is missing: {e}")
@@ -80,7 +75,7 @@ def load_config_rules():
     try:
         df = pd.read_excel(CONFIG_FILE_PATH)
         
-        # Data Cleaning: Fill NaN with empty strings to prevent errors during string comparison
+        # Data Cleaning: Fill NaN with empty strings to prevent 'float' errors during string comparison
         df.fillna("", inplace=True)
         
         # Validation: Ensure all required columns exist
@@ -92,7 +87,7 @@ def load_config_rules():
         
         # Convert to list of dictionaries for faster iteration
         rules = df.to_dict('records')
-        print(f"📋 Loaded {len(rules)} rules from Excel.")
+        print(f"📋 Loaded {len(rules)} rules from {CONFIG_FILE_PATH}")
         return rules
         
     except Exception as e:
@@ -107,26 +102,26 @@ def process_attachments(msg, rules, logs_list):
     2. Downloads them to a temp folder.
     3. Matches them against Excel rules.
     4. Moves them to the final destination.
-    5. Appends execution details to 'logs_list' for DB upload.
+    5. Appends execution details to 'logs_list'.
     """
     # Safety Check: Skip if no attachments
     if msg.Attachments.Count == 0:
         return
 
-    # Attempt to get sender name, handle cases where property might be missing (e.g. system notifications)
+    # Attempt to get sender name, handle cases where property might be missing (e.g., system notifications)
     try:
         sender_name = msg.SenderName
     except:
         sender_name = "Unknown"
 
-    # Iterate through attachments (Note: Outlook index starts at 1, not 0)
+    # Iterate through attachments (Outlook index starts at 1)
     for i in range(1, msg.Attachments.Count + 1):
         attachment = msg.Attachments.Item(i)
         filename = attachment.FileName
         
         # --- PHASE 1: DOWNLOAD TO TEMP ---
         # win32com requires an absolute path to save files. We use a temp folder first
-        # to ensure we have the file on disk before trying to move it.
+        # to ensure we have the file on disk before trying to move it to a potentially network drive.
         temp_path = os.path.join(TEMP_FOLDER, filename)
         
         try:
@@ -163,11 +158,10 @@ def process_attachments(msg, rules, logs_list):
             # Handle Extension: If rule is empty, accept any extension
             match_ext = filename.lower().endswith(r_ext) if r_ext else True
 
-            # If all conditions are met, use this rule
             if match_subject and match_filename and match_ext:
                 destination = r_dest
                 matched_rule_info = f"Rule: Subj='{r_subj}', Ext='{r_ext}'"
-                break # Stop searching, priority is top-down in Excel
+                break # Stop searching, we found the highest priority rule
 
         # --- PHASE 3: MOVE TO DESTINATION ---
         try:
@@ -207,44 +201,41 @@ def process_attachments(msg, rules, logs_list):
 
 
 # ==========================================
-# 3. MAIN FLOW (PREFECT ENABLED)
+# 3. MAIN EXECUTION FLOW
 # ==========================================
 
-# @flow decorator registers this function as a Prefect Flow.
-# 'log_prints=True' captures all print() statements and sends them to the Prefect UI.
-@flow(name="RBC Outlook Router", log_prints=True)
 def run_email_processor():
-    print("🚀 Starting Email Processor Flow...")
+    print("🚀 Starting Email Automation Script...")
     
     # 1. Load Rules
     rules = load_config_rules()
-    if not rules: 
+    if not rules:
         print("⚠️ Stopping: No rules loaded.")
         return
 
     # 2. Connect to Outlook
     inbox = get_target_inbox(TARGET_ACCOUNT_NAME)
     if not inbox: 
-        print(f"⚠️ Stopping: Cannot access Inbox for {TARGET_ACCOUNT_NAME}")
+        print("⚠️ Stopping: Inbox not found.")
         return
 
     # 3. Retrieve Unread Emails
-    # Use Restrict (server-side filter) for better performance than looping all emails
+    # We restrict the query to the server side for performance
     items = inbox.Items.Restrict("[UnRead] = True")
     items.Sort("[ReceivedTime]", True) # Sort by Newest First
 
     print(f"🔍 Found {items.Count} unread emails. Scanning for relevant subjects...")
 
     processed_count = 0
-    audit_logs = [] # Initialize empty list to collect logs
+    audit_logs = [] # Initialize empty list for logging
     
-    # ⚠️ CRITICAL: We use list(items) to create a static snapshot of the emails.
-    # Why? Modifying the collection (e.g., changing UnRead status) while iterating 
+    # ⚠️ CRITICAL: We use list(items) to create a snapshot of the emails.
+    # Why? modifying the collection (e.g., changing UnRead status) while iterating 
     # directly over the 'items' COM object can cause index shifting and skip emails.
     for msg in list(items):
         try:
             # --- Step A: Relevance Check (Optimization) ---
-            # Don't download attachments if the subject doesn't match ANY rule in Excel.
+            # Don't download attachments if the subject doesn't match ANY rule.
             is_relevant = False
             for rule in rules:
                 rule_subj = str(rule.get('Subject_Keyword', '')).strip().lower()
@@ -258,13 +249,13 @@ def run_email_processor():
                 continue
 
             # --- Step B: Process Attachments ---
-            print(f"📧 Processing Relevant Email: {msg.Subject}")
+            print(f"📧 processing Relevant Email: {msg.Subject}")
             process_attachments(msg, rules, audit_logs)
             
             # --- Step C: Mark as Read ---
-            # As per requirement: If subject matches, mark read regardless of whether attachments were found/moved.
+            # As per requirement: If subject matches, mark read regardless of attachment outcome
             msg.UnRead = False
-            msg.Save() # Explicitly save the state change to Exchange
+            msg.Save() # Explicitly save the change state
             processed_count += 1
             print("   ✨ Marked as Read.")
 
@@ -274,42 +265,34 @@ def run_email_processor():
     # ==========================================
     # 4. LOGGING & DATABASE UPLOAD
     # ==========================================
-    print(f"🏁 Batch Finished. Emails Processed: {processed_count}")
+    print(f"\n🏁 Batch Finished. Total Emails Processed: {processed_count}")
 
     # Only attempt upload if there are actual logs
     if processed_count >= 1 and len(audit_logs) > 0:
-        print("📊 Preparing Audit Log DataFrame...")
+        print("📊 Preparing Audit Logs...")
         
         df_log = pd.DataFrame(audit_logs)
         
         # Print sample to console for quick verification
         print("--- Log Preview ---")
-        print(df_log.head(3))
-        
+        print(df_log.head(3)) 
+        print(f"Total Records: {len(df_log)}")
+
         # --- DB Upload ---
-        # Note: Ensure 'create_engine' is a valid SQLAlchemy engine object
-        if create_engine != "TO BE ADDED":
-            try:
-                print(f"⏳ Uploading to Database Table: {DB_TABLE_NAME}...")
-                
-                # Using 'append' to add new rows without deleting old history
-                # index=False ensures we don't upload the Pandas row index
-                df_log.to_sql(DB_TABLE_NAME, con=create_engine, if_exists='append', index=False)
-                
-                print("✅ Database Upload Successful.")
-            except Exception as db_err:
-                print(f"❌ DATABASE UPLOAD FAILED: {db_err}")
-        else:
-            print("⚠️ Skipping DB Upload: Engine not configured.")
+        try:
+            print(f"⏳ Uploading to Database Table: {DB_TABLE_NAME}...")
+            
+            # Using 'append' to add new rows without deleting old history
+            # index=False ensures we don't upload the Pandas row numbers
+            df_log.to_sql(DB_TABLE_NAME, con=create_engine, if_exists='append', index=False)
+            
+            print("✅ Database Upload Successful.")
+            
+        except Exception as db_err:
+            print(f"❌ DATABASE UPLOAD FAILED: {db_err}")
+            print("💡 Check your 'create_engine' object and network connection.")
     else:
         print("ℹ️ No relevant activity to log this run.")
 
-
 if __name__ == "__main__":
-    # .serve() creates a long-running process that polls for the flow.
-    # 'interval=60' means this flow will run automatically every 60 seconds.
-    run_email_processor.serve(
-        name="prod-minutely",
-        interval=60,
-        tags=["outlook", "prod"]
-    )
+    run_email_processor()
