@@ -1,0 +1,315 @@
+import win32com.client
+import os
+import shutil
+import pandas as pd
+import pythoncom
+from datetime import datetime
+from prefect import flow  # Prefect Core Import
+
+# ==========================================
+# 1. CONFIGURATION & SETUP
+# ==========================================
+# The display name of the target Outlook account. 
+# MUST match exactly what you see in Outlook (e.g., 'Data Team' or 'data.team@rbc.com')
+TARGET_ACCOUNT_NAME = "data.team@rbc.com"
+
+# Local File System Paths
+CONFIG_FILE_PATH = r"C:\Work\config.xlsx"   # Excel rule file
+TEMP_FOLDER = r"C:\temp3"                   # Staging folder for downloading attachments
+DEFAULT_FOLDER = r"C:\temp4"                # Fallback folder if no rules match
+
+# Database Configuration
+# ⚠️ ACTION REQUIRED: Replace the string below with your actual SQLAlchemy engine object.
+# Example: create_engine('mssql+pyodbc://user:pwd@host/db?driver=ODBC+Driver+17+for+SQL+Server')
+create_engine = "TO BE ADDED" 
+DB_TABLE_NAME = "Email_Automation_Logs"
+
+# Ensure all necessary local directories exist to prevent 'PathNotFound' errors
+for f in [TEMP_FOLDER, DEFAULT_FOLDER]:
+    os.makedirs(f, exist_ok=True)
+
+
+# ==========================================
+# 2. HELPER FUNCTIONS
+# ==========================================
+
+def get_target_inbox(account_name):
+    """
+    Connects to the Outlook MAPI namespace and retrieves the 'Inbox' folder
+    for a specific account name.
+    
+    Args:
+        account_name (str): The display name of the email account.
+    
+    Returns:
+        Outlook.MAPIFolder: The Inbox folder object, or None if not found.
+    """
+    # CRITICAL: Initialize COM library. 
+    # Prefect runs flows in separate threads/processes. win32com is sensitive to threading.
+    # Without this, you might get 'CoInitialize has not been called' errors.
+    pythoncom.CoInitialize()
+    
+    outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    
+    # Loop through all root folders (Accounts) to find the match
+    for folder in outlook.Folders:
+        # Case-insensitive comparison for robustness
+        if folder.Name.lower() == account_name.lower():
+            try:
+                # Direct access to 'Inbox'. 
+                # Note: If using Chinese Outlook, change this to "收件箱"
+                return folder.Folders("Inbox")
+            except Exception as e:
+                print(f"❌ Account '{account_name}' found, but 'Inbox' folder is missing: {e}")
+                return None
+                
+    print(f"❌ Could not find any account matching: {account_name}")
+    return None
+
+
+def load_config_rules():
+    """
+    Reads the automation rules from Excel.
+    
+    Expected Columns:
+    - Subject_Keyword: Substring to look for in Email Subject.
+    - Attachment_Keyword: Substring to look for in Filename.
+    - File_Extension: Specific file type (e.g., '.pdf').
+    - Destination_Folder: Where to move the file.
+    """
+    try:
+        df = pd.read_excel(CONFIG_FILE_PATH)
+        
+        # Data Cleaning: Fill NaN with empty strings to prevent errors during string comparison
+        df.fillna("", inplace=True)
+        
+        # Validation: Ensure all required columns exist
+        expected_cols = ['Subject_Keyword', 'Attachment_Keyword', 'File_Extension', 'Destination_Folder']
+        for col in expected_cols:
+            if col not in df.columns:
+                # Add missing column with empty values to prevent KeyError later
+                df[col] = "" 
+        
+        # Convert to list of dictionaries for faster iteration
+        rules = df.to_dict('records')
+        print(f"📋 Loaded {len(rules)} rules from Excel.")
+        return rules
+        
+    except Exception as e:
+        print(f"❌ Critical Error: Failed to load config excel. Reason: {e}")
+        return []
+
+
+def process_attachments(msg, rules, logs_list):
+    """
+    Core Logic:
+    1. Iterates through all attachments in a single email.
+    2. Downloads them to a temp folder.
+    3. Matches them against Excel rules.
+    4. Moves them to the final destination.
+    5. Appends execution details to 'logs_list' for DB upload.
+    """
+    # Safety Check: Skip if no attachments
+    if msg.Attachments.Count == 0:
+        return
+
+    # Attempt to get sender name, handle cases where property might be missing (e.g. system notifications)
+    try:
+        sender_name = msg.SenderName
+    except:
+        sender_name = "Unknown"
+
+    # Iterate through attachments (Note: Outlook index starts at 1, not 0)
+    for i in range(1, msg.Attachments.Count + 1):
+        attachment = msg.Attachments.Item(i)
+        filename = attachment.FileName
+        
+        # --- PHASE 1: DOWNLOAD TO TEMP ---
+        # win32com requires an absolute path to save files. We use a temp folder first
+        # to ensure we have the file on disk before trying to move it.
+        temp_path = os.path.join(TEMP_FOLDER, filename)
+        
+        try:
+            attachment.SaveAsFile(temp_path)
+        except Exception as e:
+            print(f"   ❌ Failed to save attachment '{filename}': {e}")
+            # Log the failure
+            logs_list.append({
+                "Execution_Time": datetime.now(),
+                "Email_Subject": msg.Subject,
+                "Sender": sender_name,
+                "Attachment": filename,
+                "Status": "Failed (Save)",
+                "Destination": "",
+                "Matched_Rule": str(e)
+            })
+            continue # Skip to next attachment
+
+        # --- PHASE 2: MATCH RULES ---
+        destination = DEFAULT_FOLDER
+        matched_rule_info = "Default (No Match)"
+
+        for rule in rules:
+            # Normalize inputs to lowercase for consistent matching
+            r_subj = str(rule.get('Subject_Keyword', '')).strip().lower()
+            r_att  = str(rule.get('Attachment_Keyword', '')).strip().lower()
+            r_ext  = str(rule.get('File_Extension', '')).strip().lower() 
+            r_dest = rule.get('Destination_Folder')
+
+            # Logic: Match Subject AND Filename AND Extension
+            match_subject = r_subj in msg.Subject.lower()
+            match_filename = r_att in filename.lower()
+            
+            # Handle Extension: If rule is empty, accept any extension
+            match_ext = filename.lower().endswith(r_ext) if r_ext else True
+
+            # If all conditions are met, use this rule
+            if match_subject and match_filename and match_ext:
+                destination = r_dest
+                matched_rule_info = f"Rule: Subj='{r_subj}', Ext='{r_ext}'"
+                break # Stop searching, priority is top-down in Excel
+
+        # --- PHASE 3: MOVE TO DESTINATION ---
+        try:
+            # Ensure destination folder exists (Create it if missing)
+            os.makedirs(destination, exist_ok=True)
+            
+            final_path = os.path.join(destination, filename)
+            
+            # Move the file (Overwrite if exists - standard shutil behavior)
+            shutil.move(temp_path, final_path)
+            
+            print(f"   ✅ Processed: {filename} -> {destination}")
+            
+            # Log Success
+            logs_list.append({
+                "Execution_Time": datetime.now(),
+                "Email_Subject": msg.Subject,
+                "Sender": sender_name,
+                "Attachment": filename,
+                "Status": "Success",
+                "Destination": final_path,
+                "Matched_Rule": matched_rule_info
+            })
+            
+        except Exception as e:
+            print(f"   ❌ Failed to move file to {destination}: {e}")
+            # Log Failure
+            logs_list.append({
+                "Execution_Time": datetime.now(),
+                "Email_Subject": msg.Subject,
+                "Sender": sender_name,
+                "Attachment": filename,
+                "Status": "Failed (Move)",
+                "Destination": destination,
+                "Matched_Rule": str(e)
+            })
+
+
+# ==========================================
+# 3. MAIN FLOW (PREFECT ENABLED)
+# ==========================================
+
+# @flow decorator registers this function as a Prefect Flow.
+# 'log_prints=True' captures all print() statements and sends them to the Prefect UI.
+@flow(name="RBC Outlook Router", log_prints=True)
+def run_email_processor():
+    print("🚀 Starting Email Processor Flow...")
+    
+    # 1. Load Rules
+    rules = load_config_rules()
+    if not rules: 
+        print("⚠️ Stopping: No rules loaded.")
+        return
+
+    # 2. Connect to Outlook
+    inbox = get_target_inbox(TARGET_ACCOUNT_NAME)
+    if not inbox: 
+        print(f"⚠️ Stopping: Cannot access Inbox for {TARGET_ACCOUNT_NAME}")
+        return
+
+    # 3. Retrieve Unread Emails
+    # Use Restrict (server-side filter) for better performance than looping all emails
+    items = inbox.Items.Restrict("[UnRead] = True")
+    items.Sort("[ReceivedTime]", True) # Sort by Newest First
+
+    print(f"🔍 Found {items.Count} unread emails. Scanning for relevant subjects...")
+
+    processed_count = 0
+    audit_logs = [] # Initialize empty list to collect logs
+    
+    # ⚠️ CRITICAL: We use list(items) to create a static snapshot of the emails.
+    # Why? Modifying the collection (e.g., changing UnRead status) while iterating 
+    # directly over the 'items' COM object can cause index shifting and skip emails.
+    for msg in list(items):
+        try:
+            # --- Step A: Relevance Check (Optimization) ---
+            # Don't download attachments if the subject doesn't match ANY rule in Excel.
+            is_relevant = False
+            for rule in rules:
+                rule_subj = str(rule.get('Subject_Keyword', '')).strip().lower()
+                # Check if rule subject keyword is present in email subject
+                if rule_subj and rule_subj in msg.Subject.lower():
+                    is_relevant = True
+                    break
+            
+            if not is_relevant:
+                # Skip irrelevant emails entirely
+                continue
+
+            # --- Step B: Process Attachments ---
+            print(f"📧 Processing Relevant Email: {msg.Subject}")
+            process_attachments(msg, rules, audit_logs)
+            
+            # --- Step C: Mark as Read ---
+            # As per requirement: If subject matches, mark read regardless of whether attachments were found/moved.
+            msg.UnRead = False
+            msg.Save() # Explicitly save the state change to Exchange
+            processed_count += 1
+            print("   ✨ Marked as Read.")
+
+        except Exception as e:
+            print(f"⚠️ Error processing email object: {e}")
+
+    # ==========================================
+    # 4. LOGGING & DATABASE UPLOAD
+    # ==========================================
+    print(f"🏁 Batch Finished. Emails Processed: {processed_count}")
+
+    # Only attempt upload if there are actual logs
+    if processed_count >= 1 and len(audit_logs) > 0:
+        print("📊 Preparing Audit Log DataFrame...")
+        
+        df_log = pd.DataFrame(audit_logs)
+        
+        # Print sample to console for quick verification
+        print("--- Log Preview ---")
+        print(df_log.head(3))
+        
+        # --- DB Upload ---
+        # Note: Ensure 'create_engine' is a valid SQLAlchemy engine object
+        if create_engine != "TO BE ADDED":
+            try:
+                print(f"⏳ Uploading to Database Table: {DB_TABLE_NAME}...")
+                
+                # Using 'append' to add new rows without deleting old history
+                # index=False ensures we don't upload the Pandas row index
+                df_log.to_sql(DB_TABLE_NAME, con=create_engine, if_exists='append', index=False)
+                
+                print("✅ Database Upload Successful.")
+            except Exception as db_err:
+                print(f"❌ DATABASE UPLOAD FAILED: {db_err}")
+        else:
+            print("⚠️ Skipping DB Upload: Engine not configured.")
+    else:
+        print("ℹ️ No relevant activity to log this run.")
+
+
+if __name__ == "__main__":
+    # .serve() creates a long-running process that polls for the flow.
+    # 'interval=60' means this flow will run automatically every 60 seconds.
+    run_email_processor.serve(
+        name="prod-minutely",
+        interval=60,
+        tags=["outlook", "prod"]
+    )
