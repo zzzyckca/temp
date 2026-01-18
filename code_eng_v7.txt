@@ -6,48 +6,50 @@ import base64
 IMAP_SERVER = 'imap.fg.rbc.com'
 IMAP_PORT = 993
 
+# 【修正關鍵】手動定義這些可能會缺失的常數 (Hex 值)
+# 這樣就不怕 pywin32 版本不同找不到 attribute 了
+ISC_REQ_CONFIDENTIALITY = 0x00000010
+SECURITY_NATIVE_DREP = 0x00000010
+
 def imap_ntlm_auth(server_host, port):
     try:
         print(f"正在連線到 {server_host}...")
         imap = imaplib.IMAP4_SSL(server_host, port)
         print("連線成功。")
 
-        # 【修正 1】參數改為 7 個，並直接取得 handle (不需要 [0])
+        # 1. 取得 NTLM 憑證 (Handle)
+        # 這裡用 7 個參數
         creds = win32security.AcquireCredentialsHandle(
             None, "NTLM", win32security.SECPKG_CRED_OUTBOUND, 
             None, None, None, None
         )
         
-        # 建立一個變數來存儲 Context (第一次是 None)
         ctx = None
 
         def ntlm_handler(response):
-            nonlocal ctx # 讓這個函數可以修改外面的 ctx 變數
+            nonlocal ctx
             
-            # response 是 Server 傳來的 Challenge (bytes)
-            # 如果 response 是空的，代表是第一步 (Type 1 Message)
-            
-            # 設定輸入緩衝區 (Input Buffer)
+            # 如果是第一次 (response 為空)
             if not response:
                 in_buf = None
             else:
+                # 建立輸入 Buffer
                 in_buf = win32security.PySecBufferType(
                     win32security.SECBUFFER_TOKEN, response
                 )
 
-            # 【修正 2】改用 win32security.InitializeSecurityContext(...)
-            # 參數順序：憑證, 現有Context, TargetName, Requirements, DataRep, InputBuffer
+            # 2. 呼叫 InitializeSecurityContext
+            # 【修正】這裡直接使用我們上面手動定義的數字 (ISC_REQ_CONFIDENTIALITY)
             err, new_ctx, out_buf = win32security.InitializeSecurityContext(
                 creds, ctx, None, 
-                win32security.ISC_REQ_CONFIDENTIALITY, 
-                win32security.SECURITY_NATIVE_DREP, 
+                ISC_REQ_CONFIDENTIALITY,  # 改用變數
+                SECURITY_NATIVE_DREP,     # 改用變數
                 in_buf
             )
             
-            # 更新 Context 以便下一步使用
             ctx = new_ctx
             
-            # out_buf 是一個 list，我們要拿出裡面的 Buffer (bytes) 回傳給 Server
+            # 回傳 Token 給 Server
             return out_buf[0].Buffer
 
         print("正在嘗試 NTLM 驗證 (使用 Windows 憑證)...")
@@ -58,11 +60,11 @@ def imap_ntlm_auth(server_host, port):
         print(f"✅ 驗證結果: {result}")
         print("🎉 成功登入！")
         
-        # 檢查一下預設進了哪個信箱
+        # 檢查資料夾
         imap.select('INBOX')
         status, folders = imap.list()
         print(f"📂 信箱資料夾列表 ({len(folders)} 個):")
-        for folder in folders[:5]: # 只印前 5 個避免洗版
+        for folder in folders[:5]:
             print(folder.decode())
         
         imap.logout()
@@ -70,7 +72,6 @@ def imap_ntlm_auth(server_host, port):
 
     except Exception as e:
         print(f"❌ 發生錯誤: {e}")
-        # 印出詳細錯誤以便除錯
         import traceback
         traceback.print_exc()
         return False
