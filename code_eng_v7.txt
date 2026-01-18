@@ -1,22 +1,74 @@
 import imaplib
+import win32security
+import base64
 
-server = 'outlook.office365.com' # 換成你公司的 server
-port = 993
+# 設定
+IMAP_SERVER = 'imap.fg.rbc.com'
+IMAP_PORT = 993
 
-try:
-    print(f"1. 嘗試連線到 {server}...")
-    mail = imaplib.IMAP4_SSL(server, port)
-    print("2. 連線成功！Server 活著。")
-    
-    # 這是關鍵：不登入，直接問 Server 支援什麼登入方式
-    print(f"3. Server 支援的驗證方式: {mail.capabilities}")
-    
-    # 如果裡面沒有 'AUTH=PLAIN' 或 'AUTH=LOGIN'，代表他不讓你用密碼登入
-    if 'AUTH=XOAUTH2' in mail.capabilities:
-        print(">> 結論：Server 強制要求 OAuth2，純密碼登入無效。")
-    
-    mail.logout()
+def imap_ntlm_auth(server_host, port):
+    try:
+        # 1. 連線
+        print(f"正在連線到 {server_host}...")
+        imap = imaplib.IMAP4_SSL(server_host, port)
+        print("連線成功。")
 
-except Exception as e:
-    print(f"連線直接失敗: {e}")
-    print(">> 結論：IT 可能防火牆擋了 Port 993，或者是 DNS 錯。")
+        # 2. 準備 NTLM (使用 Windows 當前登入的身份，免打密碼)
+        sspi_client = win32security.AcquireCredentialsHandle(
+            None, "NTLM", win32security.SECPKG_CRED_OUTBOUND, 
+            None, None, None, None, None, 0
+        )
+        
+        # 3. 告訴 Server 我們要用 NTLM
+        # Server 會回傳一個 Challenge (第一階段)
+        # 注意：imaplib 的 authenticate 方法需要我們自己處理 Challenge/Response
+        
+        def ntlm_handler(response):
+            # 這是 imaplib 呼叫的 callback
+            # response 是 Server 傳來的 Challenge (Base64 decoded bytes)
+            
+            # 第一步：如果是空的，代表剛開始，產生 Type 1 Message
+            if not response:
+                sec_buffer, status = sspi_client[0].InitializeSecurityContext(
+                    None, None, win32security.ISC_REQ_CONFIDENTIALITY, 
+                    0, win32security.SECURITY_NATIVE_DREP, None, None
+                )
+                return sec_buffer[0].Buffer # 回傳給 Server
+            
+            # 第二步：收到 Server Challenge (Type 2)，產生 Type 3 Message
+            else:
+                # 這裡 response 是 server 的 challenge
+                input_buf = win32security.PySecBufferType(
+                    win32security.SECBUFFER_TOKEN, response
+                )
+                
+                sec_buffer, status = sspi_client[0].InitializeSecurityContext(
+                    None, input_buf, win32security.ISC_REQ_CONFIDENTIALITY, 
+                    0, win32security.SECURITY_NATIVE_DREP, None, None
+                )
+                return sec_buffer[0].Buffer # 回傳驗證結果
+
+        print("正在嘗試 NTLM 驗證 (使用 Windows 憑證)...")
+        
+        # 這裡 imaplib 會自動處理 base64 encode/decode
+        result = imap.authenticate('NTLM', ntlm_handler)
+        
+        print(f"驗證結果: {result}")
+        print("✅ 成功登入！")
+        
+        # 測試：列出資料夾
+        # imap.select('INBOX')
+        
+        imap.logout()
+        return True
+
+    except imaplib.IMAP4.error as e:
+        print(f"❌ 驗證失敗: {e}")
+        # 如果失敗，通常代表 Server 的 NTLM 設定很嚴格，或者你的 Python 環境權限不足
+        return False
+    except Exception as e:
+        print(f"❌ 發生錯誤: {e}")
+        return False
+
+if __name__ == "__main__":
+    imap_ntlm_auth(IMAP_SERVER, IMAP_PORT)
