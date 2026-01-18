@@ -1,46 +1,22 @@
 import imaplib
-import socket
 
-def test_imap_connection(server, port, username, password):
-    try:
-        print(f"正在嘗試連線至 {server}:{port}...")
-        
-        # 1. 建立 SSL 連線 (通常 IMAP 走 SSL 是 Port 993)
-        # 如果你的 server 不用 SSL (極少見)，請改用 imaplib.IMAP4(server, port)
-        mail = imaplib.IMAP4_SSL(host=server, port=port)
-        
-        print("連線成功，正在嘗試登入...")
+server = 'outlook.office365.com' # 換成你公司的 server
+port = 993
 
-        # 2. 嘗試登入
-        mail.login(username, password)
-        
-        print("✅ 登入成功！(Login Successful)")
-        print(f"Server 回應: {mail.welcome}")
+try:
+    print(f"1. 嘗試連線到 {server}...")
+    mail = imaplib.IMAP4_SSL(server, port)
+    print("2. 連線成功！Server 活著。")
+    
+    # 這是關鍵：不登入，直接問 Server 支援什麼登入方式
+    print(f"3. Server 支援的驗證方式: {mail.capabilities}")
+    
+    # 如果裡面沒有 'AUTH=PLAIN' 或 'AUTH=LOGIN'，代表他不讓你用密碼登入
+    if 'AUTH=XOAUTH2' in mail.capabilities:
+        print(">> 結論：Server 強制要求 OAuth2，純密碼登入無效。")
+    
+    mail.logout()
 
-        # 3. 登出並關閉連線
-        mail.logout()
-        return True
-
-    except imaplib.IMAP4.error as e:
-        print(f"❌ 登入失敗 (Authentication Failed): {e}")
-        return False
-    except socket.gaierror:
-        print("❌ 找不到伺服器 (DNS Error) - 請檢查 Server 地址")
-        return False
-    except socket.timeout:
-        print("❌ 連線逾時 (Timeout) - Server 沒有回應")
-        return False
-    except Exception as e:
-        print(f"❌ 發生未預期的錯誤: {e}")
-        return False
-
-# --- 設定你的資訊 ---
-# 例如 Gmail 是 'imap.gmail.com', Outlook 是 'outlook.office365.com'
-IMAP_SERVER = 'imap.example.com' 
-IMAP_PORT = 993 # SSL 通常是 993
-EMAIL_USER = 'your_email@example.com'
-EMAIL_PASS = 'your_password'
-
-# --- 執行測試 ---
-if __name__ == "__main__":
-    test_imap_connection(IMAP_SERVER, IMAP_PORT, EMAIL_USER, EMAIL_PASS)
+except Exception as e:
+    print(f"連線直接失敗: {e}")
+    print(">> 結論：IT 可能防火牆擋了 Port 993，或者是 DNS 錯。")
