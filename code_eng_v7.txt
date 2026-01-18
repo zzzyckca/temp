@@ -2,72 +2,77 @@ import imaplib
 import win32security
 import base64
 
-# 設定
+# --- 設定 ---
 IMAP_SERVER = 'imap.fg.rbc.com'
 IMAP_PORT = 993
 
 def imap_ntlm_auth(server_host, port):
     try:
-        # 1. 連線
         print(f"正在連線到 {server_host}...")
         imap = imaplib.IMAP4_SSL(server_host, port)
         print("連線成功。")
 
-        # 2. 準備 NTLM (使用 Windows 當前登入的身份，免打密碼)
-        sspi_client = win32security.AcquireCredentialsHandle(
+        # 【修正 1】參數改為 7 個，並直接取得 handle (不需要 [0])
+        creds = win32security.AcquireCredentialsHandle(
             None, "NTLM", win32security.SECPKG_CRED_OUTBOUND, 
-            None, None, None, None, None, 0
+            None, None, None, None
         )
         
-        # 3. 告訴 Server 我們要用 NTLM
-        # Server 會回傳一個 Challenge (第一階段)
-        # 注意：imaplib 的 authenticate 方法需要我們自己處理 Challenge/Response
-        
+        # 建立一個變數來存儲 Context (第一次是 None)
+        ctx = None
+
         def ntlm_handler(response):
-            # 這是 imaplib 呼叫的 callback
-            # response 是 Server 傳來的 Challenge (Base64 decoded bytes)
+            nonlocal ctx # 讓這個函數可以修改外面的 ctx 變數
             
-            # 第一步：如果是空的，代表剛開始，產生 Type 1 Message
+            # response 是 Server 傳來的 Challenge (bytes)
+            # 如果 response 是空的，代表是第一步 (Type 1 Message)
+            
+            # 設定輸入緩衝區 (Input Buffer)
             if not response:
-                sec_buffer, status = sspi_client[0].InitializeSecurityContext(
-                    None, None, win32security.ISC_REQ_CONFIDENTIALITY, 
-                    0, win32security.SECURITY_NATIVE_DREP, None, None
-                )
-                return sec_buffer[0].Buffer # 回傳給 Server
-            
-            # 第二步：收到 Server Challenge (Type 2)，產生 Type 3 Message
+                in_buf = None
             else:
-                # 這裡 response 是 server 的 challenge
-                input_buf = win32security.PySecBufferType(
+                in_buf = win32security.PySecBufferType(
                     win32security.SECBUFFER_TOKEN, response
                 )
-                
-                sec_buffer, status = sspi_client[0].InitializeSecurityContext(
-                    None, input_buf, win32security.ISC_REQ_CONFIDENTIALITY, 
-                    0, win32security.SECURITY_NATIVE_DREP, None, None
-                )
-                return sec_buffer[0].Buffer # 回傳驗證結果
+
+            # 【修正 2】改用 win32security.InitializeSecurityContext(...)
+            # 參數順序：憑證, 現有Context, TargetName, Requirements, DataRep, InputBuffer
+            err, new_ctx, out_buf = win32security.InitializeSecurityContext(
+                creds, ctx, None, 
+                win32security.ISC_REQ_CONFIDENTIALITY, 
+                win32security.SECURITY_NATIVE_DREP, 
+                in_buf
+            )
+            
+            # 更新 Context 以便下一步使用
+            ctx = new_ctx
+            
+            # out_buf 是一個 list，我們要拿出裡面的 Buffer (bytes) 回傳給 Server
+            return out_buf[0].Buffer
 
         print("正在嘗試 NTLM 驗證 (使用 Windows 憑證)...")
         
-        # 這裡 imaplib 會自動處理 base64 encode/decode
+        # 開始驗證
         result = imap.authenticate('NTLM', ntlm_handler)
         
-        print(f"驗證結果: {result}")
-        print("✅ 成功登入！")
+        print(f"✅ 驗證結果: {result}")
+        print("🎉 成功登入！")
         
-        # 測試：列出資料夾
-        # imap.select('INBOX')
+        # 檢查一下預設進了哪個信箱
+        imap.select('INBOX')
+        status, folders = imap.list()
+        print(f"📂 信箱資料夾列表 ({len(folders)} 個):")
+        for folder in folders[:5]: # 只印前 5 個避免洗版
+            print(folder.decode())
         
         imap.logout()
         return True
 
-    except imaplib.IMAP4.error as e:
-        print(f"❌ 驗證失敗: {e}")
-        # 如果失敗，通常代表 Server 的 NTLM 設定很嚴格，或者你的 Python 環境權限不足
-        return False
     except Exception as e:
         print(f"❌ 發生錯誤: {e}")
+        # 印出詳細錯誤以便除錯
+        import traceback
+        traceback.print_exc()
         return False
 
 if __name__ == "__main__":
