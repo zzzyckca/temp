@@ -1,314 +1,88 @@
-import win32com.client
-import os
-import shutil
-import pandas as pd
-import pythoncom
-from datetime import datetime
 import sys
+import subprocess
+import os
+import importlib.metadata # Requires Python 3.8+
 
-# ==========================================
-# 1. CONFIGURATION & SETUP
-# ==========================================
+# 1. Specify absolute Chrome path (non-x86 Program Files as requested)
+CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
-# The specific account to monitor. Must match the Outlook display name exactly.
-TARGET_ACCOUNT_NAME = "data.team@rbc.com"
-
-# Local File System Paths
-# CONFIG_FILE_PATH: Location of the Excel file containing automation rules.
-CONFIG_FILE_PATH = r"C:\Work\config.xlsx"   
-# TEMP_FOLDER: Staging area where attachments are initially downloaded.
-TEMP_FOLDER = r"C:\temp3"                   
-# DEFAULT_FOLDER: Fallback destination if an attachment matches the subject but not the specific rule.
-DEFAULT_FOLDER = r"C:\temp4"                
-
-# Database Configuration
-# ⚠️ ACTION REQUIRED: Replace the string below with your actual SQLAlchemy engine object.
-# Example: create_engine('mssql+pyodbc://user:pwd@host/db?driver=ODBC+Driver+17+for+SQL+Server')
-create_engine_obj = "TO BE ADDED" 
-DB_TABLE_NAME = "Email_Automation_Logs"
-
-# Ensure all necessary local directories exist to prevent 'PathNotFound' errors
-for f in [TEMP_FOLDER, DEFAULT_FOLDER]:
-    os.makedirs(f, exist_ok=True)
-
-
-# ==========================================
-# 2. HELPER FUNCTIONS
-# ==========================================
-
-def get_target_inbox(account_name):
+def get_chrome_version(file_path):
     """
-    Connects to the Outlook MAPI namespace and retrieves the 'Inbox' folder
-    for a specific account name.
-    
-    Args:
-        account_name (str): The display name of the email account (e.g., 'data.team@rbc.com')
-    
-    Returns:
-        Outlook.MAPIFolder: The Inbox folder object, or None if not found.
+    Retrieves the exact FileVersion of the executable using PowerShell.
     """
-    # CRITICAL: Initialize COM library. 
-    # When running via Task Scheduler, the script runs in a fresh process. 
-    # 'CoInitialize' is required to explicitly start the COM environment for Outlook.
-    pythoncom.CoInitialize()
-    
+    if not os.path.exists(file_path):
+        print(f"❌ Error: Chrome not found at: {file_path}")
+        sys.exit(1)
+        
+    cmd = f'(Get-Item "{file_path}").VersionInfo.FileVersion'
     try:
-        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-        
-        # Loop through all root folders (Accounts) to find the match
-        for folder in outlook.Folders:
-            # Case-insensitive comparison for robustness
-            if folder.Name.lower() == account_name.lower():
-                try:
-                    # Try accessing the standard English 'Inbox'
-                    return folder.Folders("Inbox")
-                except:
-                    # Fallback: Try Chinese '收件箱' if English fails
-                    try: return folder.Folders("收件箱")
-                    except: return None
-        return None
-    except Exception as e:
-        print(f"❌ Outlook Connection Error: {e}")
-        return None
+        # Execute PowerShell command to get version string
+        result = subprocess.check_output(["powershell", "-c", cmd], text=True)
+        return result.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to read Chrome version: {e}")
+        sys.exit(1)
 
-
-def load_config_rules():
-    """
-    Reads the automation rules from Excel.
+def check_and_update_chromedriver():
+    # Get local Chrome version (e.g., 121.0.6167.85)
+    chrome_ver = get_chrome_version(CHROME_PATH)
+    print(f"🔍 Local Chrome Version: {chrome_ver}")
     
-    Expected Columns in Excel:
-    - Subject_Keyword: Substring to look for in Email Subject.
-    - Attachment_Keyword: Substring to look for in Filename.
-    - File_Extension: Specific file type (e.g., '.pdf').
-    - Destination_Folder: Where to move the file.
-    """
+    # Extract Major.Minor.Build only.
+    # We ignore the last 'Patch' number because the driver patch version 
+    # might not exactly match the browser's, but the Build version usually ensures compatibility.
+    base_ver = ".".join(chrome_ver.split('.')[:3])
+
     try:
-        df = pd.read_excel(CONFIG_FILE_PATH)
+        # Check currently installed chromedriver-py version
+        installed_ver = importlib.metadata.version("chromedriver-py")
+        print(f"📦 Installed chromedriver-py Version: {installed_ver}")
         
-        # Data Cleaning: Fill NaN values with empty strings to prevent errors during string comparison
-        df.fillna("", inplace=True)
-        
-        # Validation: Ensure all required columns exist in the DataFrame
-        expected_cols = ['Subject_Keyword', 'Attachment_Keyword', 'File_Extension', 'Destination_Folder']
-        for col in expected_cols:
-            if col not in df.columns:
-                # Create the missing column with empty values to avoid KeyError later
-                df[col] = "" 
-        
-        # Convert to a list of dictionaries for faster iteration
-        return df.to_dict('records')
-    except Exception as e:
-        print(f"❌ Error reading config excel: {e}")
-        return []
+        # If installed version starts with the Base Version, it is compatible.
+        if installed_ver.startswith(base_ver):
+            print("✅ Version match. Proceeding...")
+            return
+    except importlib.metadata.PackageNotFoundError:
+        print("⚠️ chromedriver-py is not installed.")
 
+    print(f"🔄 Version mismatch detected. Attempting pip install for: {base_ver}.* ...")
 
-def process_attachments(msg, rules, logs_list):
-    """
-    Core Logic:
-    1. Iterates through all attachments in a single email.
-    2. Downloads them to a temp folder.
-    3. Matches them against Excel rules.
-    4. Moves them to the final destination.
-    5. Appends execution details to 'logs_list' for DB reporting.
-    """
-    # Skip processing if the email has no attachments
-    if msg.Attachments.Count == 0: return
-
-    # Attempt to get sender name, handle cases where property might be missing (e.g., system notifications)
-    try: sender_name = msg.SenderName
-    except: sender_name = "Unknown"
-
-    # Loop through attachments (Outlook index starts at 1, not 0)
-    for i in range(1, msg.Attachments.Count + 1):
-        attachment = msg.Attachments.Item(i)
-        filename = attachment.FileName
-        
-        # --- PHASE 1: DOWNLOAD TO TEMP ---
-        # win32com requires an absolute path to save files. We use a temp folder first
-        # to ensure we have the file on disk before trying to move it.
-        temp_path = os.path.join(TEMP_FOLDER, filename)
-        
-        try:
-            attachment.SaveAsFile(temp_path)
-        except Exception as e:
-            print(f"   ❌ Save Error ({filename}): {e}")
-            # Log the failure
-            logs_list.append({
-                "Execution_Time": datetime.now(),
-                "Email_Subject": msg.Subject,
-                "Sender": sender_name,
-                "Attachment": filename,
-                "Status": "Failed (Save)",
-                "Destination": "",
-                "Matched_Rule": str(e)
-            })
-            continue # Skip to next attachment
-
-        # --- PHASE 2: MATCH RULES ---
-        destination = DEFAULT_FOLDER
-        matched_rule_info = "Default (No specific match)"
-
-        for rule in rules:
-            # Normalize inputs to lowercase for consistent matching
-            r_subj = str(rule.get('Subject_Keyword', '')).strip().lower()
-            r_att  = str(rule.get('Attachment_Keyword', '')).strip().lower()
-            r_ext  = str(rule.get('File_Extension', '')).strip().lower() 
-            r_dest = rule.get('Destination_Folder')
-
-            # Logic Check:
-            # 1. Subject keyword must be in Email Subject
-            # 2. Attachment keyword must be in Filename
-            # 3. Extension must match (if specified in Excel)
-            match_subject = r_subj in msg.Subject.lower()
-            match_filename = r_att in filename.lower()
-            match_ext = filename.lower().endswith(r_ext) if r_ext else True
-
-            # If all conditions are met, select this rule and stop searching
-            if match_subject and match_filename and match_ext:
-                destination = r_dest
-                matched_rule_info = f"Rule: Subj='{r_subj}', Ext='{r_ext}'"
-                break 
-
-        # --- PHASE 3: MOVE TO DESTINATION ---
-        try:
-            # Ensure destination folder exists (Create it if missing)
-            os.makedirs(destination, exist_ok=True)
-            
-            final_path = os.path.join(destination, filename)
-            
-            # Move the file (Overwrite if exists - standard shutil behavior)
-            shutil.move(temp_path, final_path)
-            
-            print(f"   ✅ Moved: {filename} -> {destination}")
-            
-            # Log Success
-            logs_list.append({
-                "Execution_Time": datetime.now(),
-                "Email_Subject": msg.Subject,
-                "Sender": sender_name,
-                "Attachment": filename,
-                "Status": "Success",
-                "Destination": final_path,
-                "Matched_Rule": matched_rule_info
-            })
-            
-        except Exception as e:
-            print(f"   ❌ Move Error: {e}")
-            # Log Failure
-            logs_list.append({
-                "Execution_Time": datetime.now(),
-                "Email_Subject": msg.Subject,
-                "Sender": sender_name,
-                "Attachment": filename,
-                "Status": "Failed (Move)",
-                "Destination": destination,
-                "Matched_Rule": str(e)
-            })
-
-
-# ==========================================
-# 3. MAIN EXECUTION (RUN ONCE)
-# ==========================================
-
-def main():
-    """
-    Main entry point for the script.
-    Executed once per Task Scheduler trigger.
-    """
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🚀 Job Started via Task Scheduler")
+    # Define version constraints for pip.
+    # Logic: Install >= Current Build, but < Next Build
+    # Example: >= 121.0.6167, < 121.0.6168
+    next_build = int(base_ver.split('.')[-1]) + 1
+    ver_prefix = ".".join(base_ver.split('.')[:2]) # e.g., 121.0
+    upper_bound = f"{ver_prefix}.{next_build}"
     
-    # 1. Load Configuration
-    rules = load_config_rules()
-    if not rules: 
-        print("⚠️ Stopping: No rules loaded from Excel.")
-        return
+    pkg_req = f"chromedriver-py>={base_ver},<{upper_bound}"
 
-    # 2. Connect to Outlook
-    inbox = get_target_inbox(TARGET_ACCOUNT_NAME)
-    if not inbox: 
-        print(f"❌ Stopping: Inbox not found for {TARGET_ACCOUNT_NAME}.")
-        return
-
-    # 3. Filter Emails
-    # Use server-side restriction for performance (only get Unread emails)
     try:
-        items = inbox.Items.Restrict("[UnRead] = True")
-        items.Sort("[ReceivedTime]", True) # Sort by Newest First
-    except Exception as e:
-        print(f"❌ Outlook Access Error: {e}")
-        return
-
-    print(f"🔍 Found {items.Count} unread emails. Checking for relevant subjects...")
-
-    processed_count = 0
-    audit_logs = [] # Initialize empty list to capture log data
-    
-    # ⚠️ CRITICAL: We use 'list(items)' to create a static snapshot of the emails.
-    # Why? Modifying the 'UnRead' status while iterating directly over the COM object
-    # changes the collection size, which can cause the loop to skip emails.
-    for msg in list(items):
-        try:
-            # --- Relevance Check (Optimization) ---
-            # Don't download attachments if the email subject doesn't match ANY rule.
-            is_relevant = False
-            for rule in rules:
-                rule_subj = str(rule.get('Subject_Keyword', '')).strip().lower()
-                # Check if rule keyword exists in email subject
-                if rule_subj and rule_subj in msg.Subject.lower():
-                    is_relevant = True
-                    break
-            
-            if not is_relevant:
-                # Skip this email entirely (leave as Unread, do not process)
-                continue
-
-            print(f"📧 Processing: {msg.Subject}")
-            
-            # Process attachments (Download -> Match -> Move)
-            process_attachments(msg, rules, audit_logs)
-            
-            # --- Mark as Read ---
-            # Requirement: If subject matches, mark as read regardless of attachment outcome.
-            msg.UnRead = False
-            msg.Save() # Explicitly save state to Exchange server
-            processed_count += 1
-            print("   ✨ Marked as Read.")
-
-        except Exception as e:
-            print(f"⚠️ Error processing email object: {e}")
-
-    # ==========================================
-    # 4. LOGGING & DATABASE UPLOAD
-    # ==========================================
-    
-    # Only proceed if we processed at least one email and have logs
-    if processed_count >= 1 and len(audit_logs) > 0:
-        print("📊 Generating Audit Log DataFrame...")
+        # Run pip install.
+        # This will utilize your system's pip.ini configuration for proxy settings.
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_req])
         
-        df_log = pd.DataFrame(audit_logs)
-        
-        # Display sample in console for debugging
-        print(df_log.head(3))
-        
-        # Check if DB Engine is configured
-        if create_engine_obj != "TO BE ADDED":
-            try:
-                print(f"⏳ Uploading to Database Table: {DB_TABLE_NAME}...")
-                
-                # Upload to SQL Server
-                # if_exists='append': Add new rows, do not overwrite table
-                # index=False: Do not upload the pandas index column
-                df_log.to_sql(DB_TABLE_NAME, con=create_engine_obj, if_exists='append', index=False)
-                
-                print("✅ Database Upload Successful.")
-            except Exception as db_err:
-                print(f"❌ Database Upload Failed: {db_err}")
-        else:
-            print("ℹ️ Info: DB Engine is not configured. Logs are retained in memory only.")
-    else:
-        print("ℹ️ No relevant emails found or processed in this run.")
+        print("🎉 Update successful! The script must be restarted to load the new library.")
+        print("=========================================")
+        # Exit to force a restart. Python cannot reload the DLL/Binary in the same process.
+        sys.exit(0) 
+    except subprocess.CalledProcessError:
+        print("❌ Update failed. Please check if the version exists on PyPI or verify pip.ini settings.")
+        sys.exit(1)
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🏁 Job Finished.")
+# --- Main Execution Flow ---
 
-if __name__ == "__main__":
-    main()
+# 1. Run the auto-update check first
+check_and_update_chromedriver()
+
+# 2. Imports are placed here to ensure we use the updated package
+import chromedriver_py
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+
+print("🚀 Launching Chrome Driver...")
+service = Service(chromedriver_py.binary_path)
+driver = webdriver.Chrome(service=service)
+
+# Test connection
+driver.get("https://www.google.com")
+print("✅ Browser launched successfully.")
