@@ -2,9 +2,12 @@ import pandas as pd
 from TM1py import TM1Service
 
 # ==========================================
-# 1. 設定區域
+# 1. 設定區域 (Configuration)
 # ==========================================
-# 🔑 填回連線資訊
+EXCEL_FILE = 'input_params.xlsx'       # 你的 Input Excel
+OUTPUT_FILE = 'final_result.csv'       # 你的 Output CSV
+DERIVED_TIME_PERIOD = 'F2026.01'       # Python 自動填的時間
+
 TM1_CONFIG = {
     'address': 'localhost',
     'port': 12345,
@@ -12,78 +15,153 @@ TM1_CONFIG = {
     'password': 'password',
     'ssl': True
 }
-
-CUBE_NAME = "cb_reporting" 
-
-print(f"正在連線並查詢 Cube: [{CUBE_NAME}] ...")
+CUBE_NAME = "cb_reporting"
 
 # ==========================================
-# 2. 參數設定 (Context Map)
+# 2. 準備 Excel (Master Table)
 # ==========================================
-context_map = {
-    'Account':                       'BS174',
-    'Operating_Unit':                '83146',
-    'Scenario':                      'Adjusted Actual',
-    'Measure':                       'Mx_2',
-    
-    # ✅ 使用這個不會報錯的格式
-    'Time_Period':                   '2025.01',
-    
-    # --- 其他 Context ---
-    'Amt_Type':                      'Display',
-    'Currency':                      'All Currencies',
-    'Currency_Display':              'CAD',
-    'Project':                       'Total Leafs',
-    'Product':                       'Total Leafs',
-    'Channel':                       'Total Leafs',
-    'Segment':                       'Total Leafs',
-    'GAAP':                          'CBTOTAL',
-    'Counter_Party_Operating_Unit':  'Total Leafs',
+print("--- 1. Reading Excel file ---")
+# 讀取 Excel
+try:
+    df_master = pd.read_excel(EXCEL_FILE)
+except Exception as e:
+    print(f"❌ 無法讀取 Excel: {e}")
+    exit()
+
+# 強制全部轉 String (避免 Account 123 變成數字 123)
+df_master = df_master.astype(str)
+
+# 🔥 清洗 Columns: 轉細楷 + 去空格 (跟 TM1 回傳的格式對齊)
+df_master.columns = df_master.columns.str.lower().str.strip()
+
+# 🔥 防呆: 移除重複 Columns (費事這一步報錯)
+df_master = df_master.loc[:, ~df_master.columns.duplicated()]
+
+# 插入 Time Period
+print(f"Adding Time_Period: {DERIVED_TIME_PERIOD}")
+df_master['time_period'] = DERIVED_TIME_PERIOD
+
+print(f"Excel Columns (Join Keys): {df_master.columns.tolist()}")
+
+# ==========================================
+# 3. 定義 Mapping
+# ==========================================
+# 左邊: Excel Column Header (已轉細楷)
+# 右邊: TM1 Dimension Name
+# ⚠️ 根據你的截圖，TM1 回傳的全部都係細楷，所以這裡全部用細楷最穩陣
+ROW_DIM_MAPPING = {
+    'account':                      'account',
+    'operating_unit':               'operating_unit',
+    'scenario':                     'scenario',
+    'time_period':                  'time_period',
+    'currency':                     'currency',
+    'currency_display':             'currency_display',
+    'project':                      'project',
+    'product':                      'product',
+    'channel':                      'channel',
+    'segment':                      'segment',
+    'gaap':                         'gaap',
+    'counter_party_operating_unit': 'counter_party_operating_unit',
+    'amt_type':                     'amt_type',
+    'measure':                      'measure'  # 你的截圖顯示 measure 也是一個 column
 }
 
 # ==========================================
-# 3. 處理 Measure & 組合 MDX
+# 4. 組裝 MDX (Batch Query)
 # ==========================================
+print("--- 2. Constructing MDX ---")
+
+row_mdx_parts = []
+valid_keys = [] # 用來記錄哪些欄位真的會用來做 Join
+
+for excel_col, tm1_dim in ROW_DIM_MAPPING.items():
+    if excel_col in df_master.columns:
+        # 拎 Unique Values 做 MDX Set
+        unique_items = [str(x) for x in df_master[excel_col].unique() if x and str(x).lower() != 'nan']
+        
+        if unique_items:
+            # { [Dim].[Item1], [Dim].[Item2] }
+            mdx_set = "{" + ",".join([f"[{tm1_dim}].[{item}]" for item in unique_items]) + "}"
+            row_mdx_parts.append(mdx_set)
+            valid_keys.append(excel_col) # 記低這個 Key
+
+# CrossJoin
+row_mdx_str = " * ".join(row_mdx_parts)
+
+# Query: Columns 放空 {}, Rows 放所有維度
+mdx_query = f"""
+SELECT
+    {{ }} ON 0,
+    ( {row_mdx_str} ) ON 1
+FROM [{CUBE_NAME}]
+"""
+
+# ==========================================
+# 5. 執行 TM1 Query
+# ==========================================
+print("--- 3. Executing TM1 Query ---")
+df_tm1 = pd.DataFrame()
+
 try:
-    # 從字典中取出 Measure，因為它要放在 Columns
-    if 'Measure' in context_map:
-        measure_elem = context_map.pop('Measure')
-    else:
-        measure_elem = 'Mx_2'
-
-    # 組合 Rows (剩下的維度)
-    row_mdx_parts = []
-    for dim, elem in context_map.items():
-        row_mdx_parts.append(f"[{dim}].[{elem}]")
-    
-    row_mdx_str = " * ".join([f"{{{p}}}" for p in row_mdx_parts])
-    
-    # 🔥 重點修改：移除了 'NON EMPTY'
-    # 這樣就算數值是 0 或 null，它也會回傳結果
-    mdx_query = f"""
-    SELECT
-        {{[Measure].[{measure_elem}]}} ON COLUMNS,
-        ( {row_mdx_str} ) ON ROWS
-    FROM [{CUBE_NAME}]
-    """
-    
-    # Optional: 印出 MDX 檢查
-    # print(mdx_query)
-
-    # ==========================================
-    # 4. 執行查詢
-    # ==========================================
     with TM1Service(**TM1_CONFIG) as tm1:
-        print("正在執行 Query (已移除 NON EMPTY)...")
-        df = tm1.cells.execute_mdx_dataframe(mdx_query)
-        
-        if not df.empty:
-            print("\n✅ 成功！座標正確！數據如下：")
-            print(df)
-            # 如果這裡是 NaN 或 0，代表你終於連通了，只是那格剛好沒數
-        else:
-            print("\n❌ 仍然是空結果。這非常罕見。")
-            print("這通常代表 CrossJoin 的其中一個維度 (不一定是 Time) 即使存在，但不在這個 Cube 的有效範圍內。")
+        # 執行 Query
+        df_tm1 = tm1.cells.execute_mdx_dataframe(mdx_query)
+        
+        # Reset Index (把 Dimensions 變成 Columns)
+        df_tm1 = df_tm1.reset_index()
+        
+        # 🔥 轉細楷 (確保跟 Excel 一樣)
+        df_tm1.columns = df_tm1.columns.str.lower().str.strip()
+        
+        print(f"TM1 Returned {len(df_tm1)} rows.")
+        # print(df_tm1.head()) # Debug 用
 
 except Exception as e:
-    print(f"\n❌ 錯誤: {e}")
+    print(f"❌ TM1 Error: {e}")
+    exit()
+
+# ==========================================
+# 6. Direct Join (Excel Left Join TM1)
+# ==========================================
+if not df_tm1.empty:
+    print("--- 4. Merging Data ---")
+    
+    # 1. 處理 Value Column
+    # 你的截圖顯示 column 名係 'Value' (大寫 V)，轉左細楷應該變 'value'
+    # 我地將佢改名做 'tm1_value' 費事撞名
+    val_col = 'value' if 'value' in df_tm1.columns else None
+    
+    # 如果找不到 value，試下找 'values' 或者取最後一欄
+    if not val_col and 'values' in df_tm1.columns: val_col = 'values'
+    if not val_col: val_col = df_tm1.columns[-1]
+
+    print(f"Mapping Value Column: [{val_col}] -> [tm1_value]")
+    df_tm1.rename(columns={val_col: 'tm1_value'}, inplace=True)
+
+    # 2. 確保 Keys 格式一致 (String)
+    for col in valid_keys:
+        if col in df_tm1.columns:
+            df_tm1[col] = df_tm1[col].astype(str)
+
+    # 3. Left Join
+    # 使用 valid_keys (即係 Excel 存在的那些維度 columns) 做 Key
+    final_df = pd.merge(
+        df_master,
+        df_tm1,
+        how='left',
+        on=valid_keys
+    )
+
+    # 4. 填補 0 (NaN -> 0)
+    final_df['tm1_value'] = final_df['tm1_value'].fillna(0)
+    
+    # Output
+    final_df.to_csv(OUTPUT_FILE, index=False)
+    print(f"✅ Success! Saved to: {OUTPUT_FILE}")
+    print(final_df[['account', 'measure', 'tm1_value']].head()) # Show sample
+
+else:
+    print("⚠️ TM1 returned no data. Filling 0s.")
+    df_master['tm1_value'] = 0
+    df_master.to_csv(OUTPUT_FILE, index=False)
+
