@@ -11,26 +11,73 @@ TM1_CONFIG = {
 }
 
 def main():
-    CUBE_NAME = "cb_reporting" # 🔑 確認你的 Cube 名
+    CUBE_NAME = "cb_reporting" 
+
+    print(f"正在連線並查詢 Cube: [{CUBE_NAME}] ...")
+
+    # --- 參數設定 ---
+    context_map = {
+        'Account':                       'BS174', 
+        'Operating_Unit':                '83146', 
+        'Scenario':                      'Adjusted Actual', 
+        'Measure':                       'Mx_2', 
+        'Time_Period':                   'F2026.01',  # ✅ 使用正確的 F2026.01
+        
+        # --- 其他 Context (請確保沒有漏掉維度！) ---
+        'Amt_Type':                      'Display',
+        'Currency':                      'All Currencies',
+        'Currency_Display':              'CAD',
+        'Project':                       'Total Leafs',
+        'Product':                       'Total Leafs',
+        'Channel':                       'Total Leafs',
+        'Segment':                       'Total Leafs',
+        'GAAP':                          'CBTOTAL',
+        'Counter_Party_Operating_Unit':  'Total Leafs',
+    }
 
     try:
+        # 分離 Measure
+        if 'Measure' in context_map:
+            measure_elem = context_map.pop('Measure')
+        else:
+            measure_elem = 'Mx_2'
+
+        # 組合 Rows
+        row_mdx_parts = []
+        for dim, elem in context_map.items():
+            row_mdx_parts.append(f"[{dim}].[{elem}]")
+        
+        row_mdx_str = " * ".join([f"{{{p}}}" for p in row_mdx_parts])
+        
+        # 🔥 這裡 **沒有** NON EMPTY
+        mdx_query = f"""
+        SELECT
+            {{[Measure].[{measure_elem}]}} ON COLUMNS,
+            ( {row_mdx_str} ) ON ROWS
+        FROM [{CUBE_NAME}]
+        """
+
+        print("\n--- Generated MDX (驗證用) ---")
+        print(mdx_query)
+        print("------------------------------\n")
+
         with TM1Service(**TM1_CONFIG) as tm1:
-            print(f"正在檢查 Cube [{CUBE_NAME}] 的結構...\n")
+            print("正在執行 Query (強制讀取 0)...")
+            df = tm1.cells.execute_mdx_dataframe(mdx_query)
             
-            # 取得 Cube 的所有維度
-            dimensions = tm1.cubes.get_dimension_names(CUBE_NAME)
-            
-            print(f"✅ 這個 Cube 總共有 {len(dimensions)} 個維度：")
-            print("-" * 30)
-            for i, dim_name in enumerate(dimensions):
-                print(f"{i+1}. {dim_name}")
-            print("-" * 30)
-            
-            print("\n⚠️ 請檢查你的 Python Script 是否包含了以上 **所有** 維度。")
-            print("如果有任何一個維度不在你的 context_map 裡，請補上去！")
+            # 🔥 關鍵：將 NaN (空值) 填補為 0
+            df.fillna(0, inplace=True)
+
+            if not df.empty:
+                print("\n✅ 成功！數據如下 (包含 0)：")
+                print(df)
+            else:
+                print("\n❌ 仍然是空 DataFrame。")
+                print("這代表查詢的維度組合在 Cube 中根本無法形成有效的交集 (Tuple)。")
+                print("請回頭執行 '第一步'，檢查是否漏了維度。")
 
     except Exception as e:
-        print(f"❌ 錯誤: {e}")
+        print(f"\n❌ 錯誤: {e}")
 
 if __name__ == "__main__":
     main()
