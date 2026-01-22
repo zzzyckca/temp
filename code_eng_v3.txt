@@ -1,50 +1,106 @@
 import pandas as pd
 from TM1py import TM1Service
 
-# --- 連線設定 (你已經成功連到的設定) ---
+# --- 1. 連線設定 ---
 TM1_CONFIG = {
-    'address': 'YOUR_IP_ADDRESS', # 填番你連到果個 IP
-    'port': 12345,                # 填番你連到果個 Port
+    'address': 'localhost',  # 🔑 填番你既 IP
+    'port': 12345,           # 🔑 填番你既 HTTPPort
     'user': 'admin',
     'password': 'password',
     'ssl': True
 }
 
 def main():
+    # 🔑 Cube Name 係最危險既位。
+    # Excel 顯示 Package 係 'cb_reporting'，通常 Cube 名同 Package 名相似
+    # 如果 run 唔到話 "Cube not found"，請試下 'General Ledger' 或者問 admin 攞真名
+    CUBE_NAME = "cb_reporting" 
+
+    print(f"正在連線並查詢 Cube: [{CUBE_NAME}] ...")
+
+    # --- 2. 參數設定 (根據你全部截圖整合) ---
+    context_map = {
+        # --- 左邊 (TM1 Dimension Name) : 右邊 (Element Principal Name) ---
+        
+        # 1. Account (已確認真名)
+        'Account':                       'BS174', 
+        
+        # 2. Operating Unit (截圖見到 83146-TOTAL...)
+        'Operating_Unit':                '83146', 
+        
+        # 3. Scenario (截圖 Image 4 顯示係 Adjusted Actual)
+        'Scenario':                      'Adjusted Actual', 
+        
+        # 4. Measure (截圖 Image 2 顯示係 Mx_2)
+        'Measure':                       'Mx_2', 
+        
+        # 5. Time Period (⚠️ 這是唯一你需要手動填的，不能填 Selection)
+        # 請填入一個存在的月份或年份，例如 '2024', '2023', 'Dec-2023'
+        'Time_Period':                   '2024',  # <--- 請修改這裡
+        
+        # --- 其他固定參數 (根據 Image 2 灰色 Context) ---
+        'Amt_Type':                      'Display',
+        'Currency':                      'All Currencies',
+        'Currency_Display':              'CAD',
+        'Project':                       'Total Leafs',
+        'Product':                       'Total Leafs',
+        'Channel':                       'Total Leafs',
+        'Segment':                       'Total Leafs',
+        'GAAP':                          'CBTOTAL',
+        'Counter_Party_Operating_Unit':  'Total Leafs',
+        
+        # 確保 Excel VBA 裡的 dimension 都有包入來 (若有遺漏會用到 Default Member)
+        # 根據 VBA 截圖，應該還有 BookedCurrency ?
+        # 如果報錯 Dimension Not Found，請檢查拼字
+    }
+
+    # --- 3. 自動組裝 MDX ---
     try:
+        # 分離 Measure (放在 Column)
+        if 'Measure' in context_map:
+            measure_elem = context_map.pop('Measure')
+        else:
+            # 如果 Measure 維度唔叫 'Measure'，可能要手動改
+            measure_elem = 'Mx_2' 
+
+        # 組合 Rows
+        row_mdx_parts = []
+        for dim, elem in context_map.items():
+            row_mdx_parts.append(f"[{dim}].[{elem}]")
+        
+        # 使用 CrossJoin (*) 連結所有維度
+        row_mdx_str = " * ".join([f"{{{p}}}" for p in row_mdx_parts])
+        
+        mdx_query = f"""
+        SELECT
+            {{[Measure].[{measure_elem}]}} ON COLUMNS,
+            NON EMPTY
+            ( {row_mdx_str} ) ON ROWS
+        FROM [{CUBE_NAME}]
+        """
+
+        # print("DEBUG MDX:", mdx_query) # 想睇 MDX 可以打開呢行
+
+        # --- 4. 執行查詢 ---
         with TM1Service(**TM1_CONFIG) as tm1:
-            print("連線成功！正在檢查 Dimension 成員...")
-
-            # --- 請修改這裡：你想檢查既 Dimension 名稱 ---
-            # 根據你截圖，試下檢查 'Account' 或者 'Operating_Unit'
-            target_dimension = "Account" 
+            print("連線成功，正在執行 Query...")
             
-            # 這裡我們搜尋包含 "BS174" 的成員，睇下佢真身係咩
-            search_keyword = "BS174" 
-
-            print(f"正在搜尋 [{target_dimension}] 裡面包含 '{search_keyword}' 的成員...\n")
+            # 執行
+            df = tm1.cells.execute_mdx_dataframe(mdx_query)
             
-            # 抓取該維度的 Hierarchy (通常叫同名)
-            hierarchy = tm1.dimensions.hierarchies.get(target_dimension, target_dimension)
-            
-            # 遍歷所有成員搵真名
-            found = False
-            members = tm1.elements.get_element_names(target_dimension, target_dimension)
-            
-            for member_name in members:
-                if search_keyword.lower() in member_name.lower():
-                    print(f"🔍 找到真名 (Principal Name): '{member_name}'")
-                    
-                    # 順便睇下佢既 Alias (別名)
-                    attributes = tm1.elements.get_element_attributes(target_dimension, target_dimension, member_name)
-                    print(f"   -> Attributes (Alias): {attributes}")
-                    found = True
-
-            if not found:
-                print(f"❌ 搵唔到包含 '{search_keyword}' 的成員。可能 Dimension 名錯左？")
+            if not df.empty:
+                print("\n✅ 成功！數據如下：")
+                print(df)
+            else:
+                print("\n⚠️ 查詢成功但結果為空 (No Data)。")
+                print(f"請確認 [{context_map['Time_Period']}] 年份是否有數據，或者 [Scenario] 是否正確。")
 
     except Exception as e:
-        print(f"發生錯誤: {e}")
+        print(f"\n❌ 錯誤: {e}")
+        print("提示：")
+        print("1. 如果是 'Dimension not found' -> 請檢查 context_map 左邊的名字是否同 Server 一樣。")
+        print("2. 如果是 'Cube not found' -> 請檢查 CUBE_NAME。")
+        print("3. 如果是 'Syntax error' -> 檢查有沒有特殊符號。")
 
 if __name__ == "__main__":
     main()
