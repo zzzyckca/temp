@@ -1,141 +1,117 @@
-import win32com.client
-import pythoncom
-import os
-import shutil
 import pandas as pd
-from prefect import flow, task
-from datetime import datetime
+from TM1py import TM1Service
 
-# --- Configuration ---
-CONFIG_FILE_PATH = r"C:\Work\config.xlsx"  # Path to your Excel rule file
-TEMP_FOLDER = r"C:\Work\Temp"              # Temporary folder for downloading attachments
-DEFAULT_FOLDER = r"C:\Work\Unsorted"       # Fallback folder if no rules match
-TARGET_SUBJECT = "TRIGGER_ME"              # Email subject keyword to listen for
+# --- 1. 設定區域 ---
+EXCEL_FILE = 'parameters.xlsx'
+OUTPUT_FILE = 'final_report.csv'
 
-# Ensure necessary directories exist
-for f in [TEMP_FOLDER, DEFAULT_FOLDER]:
-    os.makedirs(f, exist_ok=True)
+# 請根據實際情況修改這裡的 Column Mapping
+# Excel Column Name : TM1 Dimension Name
+COL_MAPPING = {
+    'Year': 'Year',
+    'Region': 'Region',
+    'Department': 'Department'
+}
 
-@task(name="Load Config")
-def load_config_rules():
-    """
-    Reads the Excel configuration file and returns a list of rules.
-    Expected Excel columns: 'Keyword', 'Destination_Folder'
-    """
-    try:
-        df = pd.read_excel(CONFIG_FILE_PATH)
-        # Convert to dictionary for easier lookup. Example: [{'Keyword': 'Invoice', 'Destination_Folder': 'C:\\...'}]
-        rules = df.to_dict('records') 
-        print(f"📋 Loaded {len(rules)} rules from Excel.")
-        return rules
-    except Exception as e:
-        print(f"❌ Error reading config excel: {e}")
-        return []
+TM1_CONFIG = {
+    'address': 'localhost',
+    'port': 12345,
+    'user': 'admin',
+    'password': 'password',
+    'ssl': True
+}
 
-@task(name="Process Attachments")
-def save_and_route_attachments(message_item, rules):
+def format_mdx_set(dim_name, item_list):
+    """將 list 轉為 MDX set 字串，例如 {[Dim].[A], [Dim].[B]}"""
+    # 轉字串並去空白
+    valid_items = [str(x) for x in item_list if pd.notna(x)]
+    # 加入 TM1 語法
+    formatted = [f"[{dim_name}].[{item}]" for item in valid_items]
+    return "{" + ",".join(formatted) + "}"
+
+def main():
+    # --- 2. 讀取 Excel 並處理格式 ---
+    print("讀取 Excel...")
+    df_input = pd.read_excel(EXCEL_FILE)
+
+    # 重要：將 Excel 所有 Key Columns 強制轉為 String
+    # 因為 TM1 回傳的 Dimension 元素永遠是 String，不轉型的話 merge 會失敗
+    for col in COL_MAPPING.keys():
+        df_input[col] = df_input[col].astype(str)
+
+    # --- 3. 準備 MDX Sets ---
+    # 提取 Unique values
+    years = df_input['Year'].unique().tolist()
+    regions = df_input['Region'].unique().tolist()
+    depts = df_input['Department'].unique().tolist()
+
+    str_years = format_mdx_set(COL_MAPPING['Year'], years)
+    str_regions = format_mdx_set(COL_MAPPING['Region'], regions)
+    str_depts = format_mdx_set(COL_MAPPING['Department'], depts)
+
+    # --- 4. 組裝 Bulk MDX Query ---
+    # 這裡我們把所有維度放在 ROWS，只留 Measure 在 COLUMNS，方便轉 DataFrame
+    mdx = f"""
+    SELECT
+        {{[Measure].[Amount]}} ON COLUMNS,
+        NON EMPTY (
+            {str_years} * {str_regions} * {str_depts}
+        ) ON ROWS
+    FROM [General Ledger]
     """
-    Downloads attachments from the email, checks against Excel rules, 
-    and moves them to the specific destination folder.
-    """
-    # Note: If running in a multi-threaded environment, passing COM objects (message_item) 
-    # directly to a task can be risky. For this example, we assume single-thread or flow-level execution.
+
+    print("連接 TM1 並執行查詢...")
     
-    # Check if attachments exist
-    if message_item.Attachments.Count == 0:
-        print("No attachments found.")
+    df_tm1 = pd.DataFrame() # 初始化
+
+    try:
+        with TM1Service(**TM1_CONFIG) as tm1:
+            # 執行 MDX
+            df_tm1 = tm1.cells.execute_mdx_dataframe(mdx)
+            
+            # --- 5. 清理 TM1 回傳的 DataFrame ---
+            # execute_mdx_dataframe 回傳的 Index 通常是 Dimension Name
+            # 我們需要 Reset Index 把維度變回普通 Columns
+            df_tm1 = df_tm1.reset_index()
+            
+            # TM1py 回傳的欄位名稱通常對應 Dimension Name (e.g., "Year", "Region")
+            # 這裡我們不需要改名，除非 TM1 Dimension 名稱跟 Excel Header 不一樣
+            
+            print(f"TM1 回傳了 {len(df_tm1)} 筆廣泛數據 (Cartesian Product)。")
+
+    except Exception as e:
+        print(f"TM1 連線或查詢錯誤: {e}")
         return
 
-    # Loop through all attachments
-    # Note: Outlook indices start at 1, not 0
-    for i in range(1, message_item.Attachments.Count + 1):
-        attachment = message_item.Attachments.Item(i)
-        filename = attachment.FileName
-        print(f"📎 Processing file: {filename}")
+    # --- 6. 核心步驟：Pandas Merge (Filter) ---
+    if not df_tm1.empty:
+        print("正在進行數據合併 (Mapping)...")
 
-        # 1. Save attachment to Temp Folder first
-        # win32com requires an absolute path for saving files
-        temp_path = os.path.join(TEMP_FOLDER, filename)
-        attachment.SaveAsFile(temp_path)
-
-        # 2. Check against Excel Rules
-        # Default destination if no rule matches
-        destination = DEFAULT_FOLDER
-        matched_rule = False
-
-        for rule in rules:
-            keyword = str(rule.get('Keyword', '')).lower()
-            target_dir = rule.get('Destination_Folder')
-            
-            # Core Logic: Check if the keyword exists in the filename (case-insensitive)
-            if keyword in filename.lower():
-                destination = target_dir
-                matched_rule = True
-                print(f"✅ Matched Rule: '{keyword}' -> {destination}")
-                break # Stop checking other rules once a match is found
+        # 使用 Left Join: 以 Excel (df_input) 為主，把 TM1 數據 (df_tm1) 貼上去
+        # 這樣會自動過濾掉那些「Excel 沒要求，但 MDX 順便抓回來」的多餘組合
         
-        # 3. Move file to the final destination
-        try:
-            # Ensure the destination folder exists
-            os.makedirs(destination, exist_ok=True)
-            
-            final_path = os.path.join(destination, filename)
-            
-            # Move the file. Note: This will overwrite if file exists, or fail depending on permissions.
-            # Consider adding timestamp logic here if unique filenames are required.
-            shutil.move(temp_path, final_path)
-            print(f"🚚 Moved to: {final_path}")
-            
-        except Exception as e:
-            print(f"❌ Error moving file: {e}")
+        final_df = pd.merge(
+            df_input, 
+            df_tm1, 
+            how='left', 
+            # 指定對應關係：Left(Excel) vs Right(TM1)
+            left_on=['Year', 'Region', 'Department'],
+            right_on=['Year', 'Region', 'Department'] # 假設 TM1 Dimension 名稱一致
+        )
 
+        # 處理找不到數據的情況 (Fill NA with 0)
+        # 假設數據欄位叫 'Amount' (或是 TM1py 回傳的具體 Measure 名稱)
+        # 注意: TM1py 回傳的 Value 欄位名稱通常取決於 MDX SELECT COLUMNS 的內容
+        value_col = 'Amount' 
+        if value_col in final_df.columns:
+            final_df[value_col] = final_df[value_col].fillna(0)
 
-@flow(name="Excel_Router_Flow", log_prints=True)
-def email_router_flow():
-    """
-    Main orchestration flow:
-    1. Initialize COM
-    2. Connect to Outlook
-    3. Load Rules
-    4. Process Emails
-    5. Clean up
-    """
-    # CRITICAL: Initialize COM library for thread safety in Prefect
-    pythoncom.CoInitialize() 
-    
-    try:
-        # 1. Connect to Outlook MAPI namespace
-        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-        inbox = outlook.GetDefaultFolder(6) # Folder ID 6 = Inbox
+        # 輸出
+        final_df.to_csv(OUTPUT_FILE, index=False)
+        print(f"處理完成！結果已儲存至 {OUTPUT_FILE} (共 {len(final_df)} 行)")
         
-        # 2. Load latest rules from Excel
-        rules = load_config_rules()
-        
-        # 3. Find target emails using Outlook Restrict filter (faster than iterating all items)
-        messages = inbox.Items.Restrict(f"[UnRead] = True AND [Subject] = '{TARGET_SUBJECT}'")
-        
-        # 4. Process each email
-        # Convert to list to avoid index shifting issues when modifying items (e.g., moving them)
-        for msg in list(messages):
-            print(f"📧 New Email Found: {msg.Subject}")
-            
-            # Route attachments based on logic
-            save_and_route_attachments(msg, rules)
-            
-            # 5. Cleanup: Mark as read
-            msg.UnRead = False
-            
-            # Optional: Move the email to a "Processed" folder in Outlook to prevent re-processing
-            # processed_folder = inbox.Folders("Processed")
-            # msg.Move(processed_folder)
-            
-    except Exception as e:
-        print(f"Flow Execution Error: {e}")
-    finally:
-        # Release COM resources
-        pythoncom.CoUninitialize()
+    else:
+        print("TM1 沒有回傳任何數據，請檢查 Cube 或 MDX。")
 
 if __name__ == "__main__":
-    # Serve the flow to run indefinitely on a schedule (every 60 seconds)
-    print("🚀 Starting Outlook File Router...")
-    email_router_flow.serve(name="file-router-v1", interval=60)
+    main()
