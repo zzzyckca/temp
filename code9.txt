@@ -1,0 +1,89 @@
+import pandas as pd
+from TM1py import TM1Service
+
+# ==========================================
+# 1. 設定區域
+# ==========================================
+# 🔑 填回連線資訊
+TM1_CONFIG = {
+    'address': 'localhost',
+    'port': 12345,
+    'user': 'admin',
+    'password': 'password',
+    'ssl': True
+}
+
+CUBE_NAME = "cb_reporting" 
+
+print(f"正在連線並查詢 Cube: [{CUBE_NAME}] ...")
+
+# ==========================================
+# 2. 參數設定 (Context Map)
+# ==========================================
+context_map = {
+    'Account':                       'BS174',
+    'Operating_Unit':                '83146',
+    'Scenario':                      'Adjusted Actual',
+    'Measure':                       'Mx_2',
+    
+    # ✅ 使用這個不會報錯的格式
+    'Time_Period':                   '2025.01',
+    
+    # --- 其他 Context ---
+    'Amt_Type':                      'Display',
+    'Currency':                      'All Currencies',
+    'Currency_Display':              'CAD',
+    'Project':                       'Total Leafs',
+    'Product':                       'Total Leafs',
+    'Channel':                       'Total Leafs',
+    'Segment':                       'Total Leafs',
+    'GAAP':                          'CBTOTAL',
+    'Counter_Party_Operating_Unit':  'Total Leafs',
+}
+
+# ==========================================
+# 3. 處理 Measure & 組合 MDX
+# ==========================================
+try:
+    # 從字典中取出 Measure，因為它要放在 Columns
+    if 'Measure' in context_map:
+        measure_elem = context_map.pop('Measure')
+    else:
+        measure_elem = 'Mx_2'
+
+    # 組合 Rows (剩下的維度)
+    row_mdx_parts = []
+    for dim, elem in context_map.items():
+        row_mdx_parts.append(f"[{dim}].[{elem}]")
+    
+    row_mdx_str = " * ".join([f"{{{p}}}" for p in row_mdx_parts])
+    
+    # 🔥 重點修改：移除了 'NON EMPTY'
+    # 這樣就算數值是 0 或 null，它也會回傳結果
+    mdx_query = f"""
+    SELECT
+        {{[Measure].[{measure_elem}]}} ON COLUMNS,
+        ( {row_mdx_str} ) ON ROWS
+    FROM [{CUBE_NAME}]
+    """
+    
+    # Optional: 印出 MDX 檢查
+    # print(mdx_query)
+
+    # ==========================================
+    # 4. 執行查詢
+    # ==========================================
+    with TM1Service(**TM1_CONFIG) as tm1:
+        print("正在執行 Query (已移除 NON EMPTY)...")
+        df = tm1.cells.execute_mdx_dataframe(mdx_query)
+        
+        if not df.empty:
+            print("\n✅ 成功！座標正確！數據如下：")
+            print(df)
+            # 如果這裡是 NaN 或 0，代表你終於連通了，只是那格剛好沒數
+        else:
+            print("\n❌ 仍然是空結果。這非常罕見。")
+            print("這通常代表 CrossJoin 的其中一個維度 (不一定是 Time) 即使存在，但不在這個 Cube 的有效範圍內。")
+
+except Exception as e:
+    print(f"\n❌ 錯誤: {e}")
