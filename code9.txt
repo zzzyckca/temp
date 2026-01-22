@@ -2,11 +2,14 @@ import pandas as pd
 from TM1py import TM1Service
 
 # ==========================================
-# 1. 設定區域 (Configuration)
+# 1. 設定區域
 # ==========================================
-EXCEL_FILE = 'input_params.xlsx'       # 你的 Input Excel
-OUTPUT_FILE = 'final_result.csv'       # 你的 Output CSV
-DERIVED_TIME_PERIOD = 'F2026.01'       # Python 自動填的時間
+# 你的 Excel 檔案 (只有 Parameters，沒有 Value)
+EXCEL_FILE = 'input_params.xlsx'       
+OUTPUT_FILE = 'final_result_joined.csv'
+
+# 硬性規定的 Time Period
+DERIVED_TIME_PERIOD = 'F2026.01' 
 
 TM1_CONFIG = {
     'address': 'localhost',
@@ -15,40 +18,38 @@ TM1_CONFIG = {
     'password': 'password',
     'ssl': True
 }
-CUBE_NAME = "cb_reporting"
+CUBE_NAME = "cb_reporting" 
 
 # ==========================================
-# 2. 準備 Excel (Master Table)
+# 2. 準備 Excel Parameters
 # ==========================================
-print("--- 1. Reading Excel file ---")
-# 讀取 Excel
-try:
-    df_master = pd.read_excel(EXCEL_FILE)
-except Exception as e:
-    print(f"❌ 無法讀取 Excel: {e}")
-    exit()
-
-# 強制全部轉 String (避免 Account 123 變成數字 123)
+print("--- 1. 讀取並整理 Excel Parameters ---")
+df_master = pd.read_excel(EXCEL_FILE)
 df_master = df_master.astype(str)
 
-# 🔥 清洗 Columns: 轉細楷 + 去空格 (跟 TM1 回傳的格式對齊)
+# 1. 全部轉細楷 + 去空格 (這是最穩陣的 Join 方法)
 df_master.columns = df_master.columns.str.lower().str.strip()
 
-# 🔥 防呆: 移除重複 Columns (費事這一步報錯)
+# 2. 強制移除重複欄位 (解決 'label not unique' 的根源)
 df_master = df_master.loc[:, ~df_master.columns.duplicated()]
 
-# 插入 Time Period
-print(f"Adding Time_Period: {DERIVED_TIME_PERIOD}")
-df_master['time_period'] = DERIVED_TIME_PERIOD
+# 3. 插入 Time Period
+df_master['time_period'] = DERIVED_TIME_PERIOD.lower() # 保持細楷一致性
+
+# 4. 確保 Excel 裡的內容也是 clean 的 string
+# 特別是 measure 這一欄，因為它是 MDX 的關鍵
+if 'measure' in df_master.columns:
+    df_master['measure'] = df_master['measure'].str.strip()
 
 print(f"Excel Columns (Join Keys): {df_master.columns.tolist()}")
 
 # ==========================================
 # 3. 定義 Mapping
 # ==========================================
-# 左邊: Excel Column Header (已轉細楷)
-# 右邊: TM1 Dimension Name
-# ⚠️ 根據你的截圖，TM1 回傳的全部都係細楷，所以這裡全部用細楷最穩陣
+# 根據你的 MDX 結構：Measure on Columns, 其他 on Rows
+MEASURE_COL = 'measure'
+
+# 這裡列出所有放在 ROWS 的維度
 ROW_DIM_MAPPING = {
     'account':                      'account',
     'operating_unit':               'operating_unit',
@@ -62,106 +63,119 @@ ROW_DIM_MAPPING = {
     'segment':                      'segment',
     'gaap':                         'gaap',
     'counter_party_operating_unit': 'counter_party_operating_unit',
-    'amt_type':                     'amt_type',
-    'measure':                      'measure'  # 你的截圖顯示 measure 也是一個 column
+    'amt_type':                     'amt_type'
 }
 
 # ==========================================
-# 4. 組裝 MDX (Batch Query)
+# 4. 動態組裝 MDX (On Columns / On Rows)
 # ==========================================
-print("--- 2. Constructing MDX ---")
+print("--- 2. 組裝 MDX ---")
 
+# A. 處理 Measure (ON COLUMNS)
+# 抓出 Excel 裡 unique 的 measure (例如 Mx_2)
+unique_measures = [x for x in df_master[MEASURE_COL].unique() if x and x.lower() != 'nan']
+# 假設 TM1 維度名也是 measure
+str_measures = "{" + ",".join([f"[measure].[{item}]" for item in unique_measures]) + "}"
+
+# B. 處理 其他維度 (ON ROWS)
 row_mdx_parts = []
-valid_keys = [] # 用來記錄哪些欄位真的會用來做 Join
-
 for excel_col, tm1_dim in ROW_DIM_MAPPING.items():
     if excel_col in df_master.columns:
-        # 拎 Unique Values 做 MDX Set
-        unique_items = [str(x) for x in df_master[excel_col].unique() if x and str(x).lower() != 'nan']
-        
+        unique_items = [x for x in df_master[excel_col].unique() if x and x.lower() != 'nan']
         if unique_items:
-            # { [Dim].[Item1], [Dim].[Item2] }
             mdx_set = "{" + ",".join([f"[{tm1_dim}].[{item}]" for item in unique_items]) + "}"
             row_mdx_parts.append(mdx_set)
-            valid_keys.append(excel_col) # 記低這個 Key
 
-# CrossJoin
 row_mdx_str = " * ".join(row_mdx_parts)
 
-# Query: Columns 放空 {}, Rows 放所有維度
+# C. 完整 MDX (保留你想要的結構)
+# 注意：這裡 ON 0 是 Columns, ON 1 是 Rows
 mdx_query = f"""
 SELECT
-    {{ }} ON 0,
+    {str_measures} ON 0,
     ( {row_mdx_str} ) ON 1
 FROM [{CUBE_NAME}]
 """
 
 # ==========================================
-# 5. 執行 TM1 Query
+# 5. 執行查詢
 # ==========================================
-print("--- 3. Executing TM1 Query ---")
+print("--- 3. 連線 TM1 執行查詢 ---")
 df_tm1 = pd.DataFrame()
 
-try:
-    with TM1Service(**TM1_CONFIG) as tm1:
-        # 執行 Query
-        df_tm1 = tm1.cells.execute_mdx_dataframe(mdx_query)
-        
-        # Reset Index (把 Dimensions 變成 Columns)
-        df_tm1 = df_tm1.reset_index()
-        
-        # 🔥 轉細楷 (確保跟 Excel 一樣)
-        df_tm1.columns = df_tm1.columns.str.lower().str.strip()
-        
-        print(f"TM1 Returned {len(df_tm1)} rows.")
-        # print(df_tm1.head()) # Debug 用
-
-except Exception as e:
-    print(f"❌ TM1 Error: {e}")
-    exit()
+with TM1Service(**TM1_CONFIG) as tm1:
+    df_tm1 = tm1.cells.execute_mdx_dataframe(mdx_query)
+    
+    # 1. Reset Index (把 Dimensions 變成普通 Columns)
+    df_tm1 = df_tm1.reset_index()
+    
+    # 2. 轉細楷 (確保同 Excel 一樣)
+    df_tm1.columns = df_tm1.columns.str.lower().str.strip()
+    
+    print(f"TM1 Columns: {df_tm1.columns.tolist()}")
 
 # ==========================================
-# 6. Direct Join (Excel Left Join TM1)
+# 6. 整理數據 & Join (關鍵一步)
 # ==========================================
 if not df_tm1.empty:
-    print("--- 4. Merging Data ---")
-    
-    # 1. 處理 Value Column
-    # 你的截圖顯示 column 名係 'Value' (大寫 V)，轉左細楷應該變 'value'
-    # 我地將佢改名做 'tm1_value' 費事撞名
-    val_col = 'value' if 'value' in df_tm1.columns else None
-    
-    # 如果找不到 value，試下找 'values' 或者取最後一欄
-    if not val_col and 'values' in df_tm1.columns: val_col = 'values'
-    if not val_col: val_col = df_tm1.columns[-1]
+    print("--- 4. 整理數據 & Merge ---")
 
-    print(f"Mapping Value Column: [{val_col}] -> [tm1_value]")
-    df_tm1.rename(columns={val_col: 'tm1_value'}, inplace=True)
+    # [情境分析]
+    # 當 Measure 在 Columns 時，TM1py 回傳的結果，數值欄位名稱通常就是那個 Measure 的名字 (例如 'mx_2' 或 'value')
+    # 你的截圖顯示回傳了 'Value'。
+    
+    # 1. 找出數值欄位並改名做 'tm1_value'
+    # 這樣可以避免跟 Excel 原本的欄位撞名
+    target_val_col = None
+    
+    # 優先找 'value', 'values'
+    for col in ['value', 'values']:
+        if col in df_tm1.columns:
+            target_val_col = col
+            break
+            
+    # 如果找不到，就找 measure 的名字 (例如 mx_2)
+    if not target_val_col:
+        for m in unique_measures:
+            if m.lower() in df_tm1.columns:
+                target_val_col = m.lower()
+                break
+    
+    # 如果還是找不到，拿最後一欄當作數值
+    if not target_val_col:
+         target_val_col = df_tm1.columns[-1]
 
-    # 2. 確保 Keys 格式一致 (String)
-    for col in valid_keys:
+    print(f"鎖定數值欄位: {target_val_col} -> 改名為 'tm1_value'")
+    df_tm1.rename(columns={target_val_col: 'tm1_value'}, inplace=True)
+
+    # 2. 準備 Join Keys
+    # 我們只用 Dimensions 來對接 (Account, Org...)
+    # 這樣可以避開 'measure' 這一欄的混亂
+    join_keys = [col for col in ROW_DIM_MAPPING.keys() if col in df_master.columns]
+    
+    # 確保兩邊的 Join Keys 都是 String 格式
+    for col in join_keys:
         if col in df_tm1.columns:
             df_tm1[col] = df_tm1[col].astype(str)
 
-    # 3. Left Join
-    # 使用 valid_keys (即係 Excel 存在的那些維度 columns) 做 Key
+    # 3. 執行 Left Join
+    # Excel 是主表，TM1 是查表
     final_df = pd.merge(
         df_master,
-        df_tm1,
+        df_tm1[join_keys + ['tm1_value']], # 只取需要的欄位 Merge，避免帶入多餘的 columns
         how='left',
-        on=valid_keys
+        on=join_keys
     )
 
-    # 4. 填補 0 (NaN -> 0)
+    # 4. 填補空值
     final_df['tm1_value'] = final_df['tm1_value'].fillna(0)
     
-    # Output
+    print("Sample Result:")
+    print(final_df.head())
+    
     final_df.to_csv(OUTPUT_FILE, index=False)
-    print(f"✅ Success! Saved to: {OUTPUT_FILE}")
-    print(final_df[['account', 'measure', 'tm1_value']].head()) # Show sample
+    print(f"🎉 成功！檔案已儲存: {OUTPUT_FILE}")
 
 else:
-    print("⚠️ TM1 returned no data. Filling 0s.")
-    df_master['tm1_value'] = 0
-    df_master.to_csv(OUTPUT_FILE, index=False)
+    print("⚠️ TM1 回傳空數據，請檢查 MDX 或權限。")
 
