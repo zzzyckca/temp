@@ -1,132 +1,49 @@
-import win32com.client
-import os
-import shutil
-import pandas as pd
-from datetime import datetime
+from TM1py import TM1Service
 
-# --- Configuration ---
-# ⚠️ UPDATE THIS: The exact email address/account name found in Step 1
-TARGET_ACCOUNT_EMAIL = "data.team@rbc.com" 
-
-CONFIG_FILE_PATH = r"C:\Work\config.xlsx"   # Path to Excel config
-TEMP_FOLDER = r"C:\Work\Temp"               # Temp folder
-DEFAULT_FOLDER = r"C:\Work\Unsorted"        # Default destination
-TARGET_SUBJECT = "TRIGGER_ME"               # Trigger keyword
-
-# Ensure directories exist
-for f in [TEMP_FOLDER, DEFAULT_FOLDER]:
-    os.makedirs(f, exist_ok=True)
-
-def get_inbox_by_account(target_email):
-    """
-    Loops through all Outlook root folders to find the specific account,
-    then returns its 'Inbox' folder.
-    """
-    outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    
-    target_folder = None
-    
-    # Iterate through all accounts (root folders)
-    for folder in outlook.Folders:
-        # Case-insensitive comparison
-        if folder.Name.lower() == target_email.lower():
-            target_folder = folder
-            break
-            
-    if not target_folder:
-        print(f"❌ Could not find account: {target_email}")
-        print("Available accounts are:")
-        for f in outlook.Folders:
-            print(f" - {f.Name}")
-        return None
-    
-    try:
-        # Usually the folder is named "Inbox". 
-        # Note: If your Outlook is in Chinese, this might need to be "收件箱"
-        inbox = target_folder.Folders("Inbox")
-        return inbox
-    except Exception as e:
-        print(f"❌ Account found, but could not find 'Inbox' folder: {e}")
-        return None
-
-def load_config_rules():
-    """
-    Reads the Excel configuration file.
-    """
-    try:
-        df = pd.read_excel(CONFIG_FILE_PATH)
-        rules = df.to_dict('records')
-        print(f"📋 Loaded {len(rules)} rules from Excel.")
-        return rules
-    except Exception as e:
-        print(f"❌ Error reading config excel: {e}")
-        return []
+# --- 設定你的連線資訊 ---
+# 請修改這裡
+TM1_CONFIG = {
+    'address': 'localhost',      # TM1 Server IP (例如 192.168.1.10)
+    'port': 12345,               # 注意：這是 HTTPPort，不是 TCP Port
+    'user': 'admin',             # TM1 用戶名
+    'password': 'password',      # TM1 密碼
+    'ssl': True,                 # 通常是 True，如果連線失敗可以試試改 False
+    'namespace': ''              # 如果你是用 CAM (IBM Cognos) 登入，這裡要填 Namespace ID
+}
 
 def main():
-    print("🚀 Starting Manual Outlook Processor...")
+    print(f"正在嘗試連接到 {TM1_CONFIG['address']}:{TM1_CONFIG['port']} ...")
 
-    # 1. Get the specific Inbox
-    inbox = get_inbox_by_account(TARGET_ACCOUNT_EMAIL)
-    
-    if not inbox:
-        print("Exiting...")
-        return
+    try:
+        # 建立連線
+        with TM1Service(**TM1_CONFIG) as tm1:
+            # 如果程式跑到這裡沒報錯，代表連線已經成功
+            
+            # 抓取 Server 資訊來確認
+            server_name = tm1.server.get_server_name()
+            product_version = tm1.server.get_product_version()
+            
+            print("\n✅ 連接成功 (Connection Successful)!")
+            print("-" * 30)
+            print(f"Server Name:    {server_name}")
+            print(f"Server Version: {product_version}")
+            print("-" * 30)
+            
+            # 順便列出 Server 裡前 5 個 Cube 的名字，證明真的讀得到資料
+            cube_names = tm1.cubes.get_all_names()
+            print(f"偵測到 {len(cube_names)} 個 Cubes。前 5 個是:")
+            for name in cube_names[:5]:
+                print(f" - {name}")
 
-    # 2. Load Rules
-    rules = load_config_rules()
-    if not rules:
-        print("No rules loaded. Exiting...")
-        return
-
-    # 3. Find emails in that specific Inbox
-    print(f"🔍 Scanning Inbox of: {TARGET_ACCOUNT_EMAIL}")
-    messages = inbox.Items.Restrict(f"[UnRead] = True AND [Subject] = '{TARGET_SUBJECT}'")
-    
-    # 4. Process Loop
-    count = 0
-    for msg in list(messages):
-        print(f"📧 Processing Email: {msg.Subject}")
-        
-        if msg.Attachments.Count > 0:
-            for i in range(1, msg.Attachments.Count + 1):
-                attachment = msg.Attachments.Item(i)
-                filename = attachment.FileName
-                print(f"   📎 Found file: {filename}")
-                
-                # Save to Temp
-                temp_path = os.path.join(TEMP_FOLDER, filename)
-                attachment.SaveAsFile(temp_path)
-                
-                # Check Rules
-                destination = DEFAULT_FOLDER
-                matched = False
-                
-                for rule in rules:
-                    if str(rule.get('Keyword', '')).lower() in filename.lower():
-                        destination = rule.get('Destination_Folder')
-                        matched = True
-                        print(f"   ✅ Matched Rule: {rule.get('Keyword')} -> {destination}")
-                        break
-                
-                # Move File
-                try:
-                    os.makedirs(destination, exist_ok=True)
-                    final_path = os.path.join(destination, filename)
-                    shutil.move(temp_path, final_path)
-                    print(f"   🚚 Moved to: {final_path}")
-                except Exception as e:
-                    print(f"   ❌ Move failed: {e}")
-        else:
-            print("   (No attachments found)")
-
-        # 5. Mark as Read (Crucial to prevent re-reading)
-        msg.UnRead = False
-        count += 1
-        
-    if count == 0:
-        print("💤 No matching unread emails found.")
-    else:
-        print(f"✨ Finished processing {count} emails.")
+    except Exception as e:
+        print("\n❌ 連接失敗 (Connection Failed)")
+        print(f"錯誤訊息: {e}")
+        print("-" * 30)
+        print("排錯建議:")
+        print("1. Port 是否正確？ (請檢查 tm1s.cfg 裡的 HTTPPort，預設通常是 5xxx - 12xxx)")
+        print("2. SSL 設定是否正確？ (試著把 ssl: True 改成 ssl: False)")
+        print("3. 防火牆是否擋住了？")
+        print("4. 如果是用 CAM (SSO) 登入，記得填寫 'namespace' 參數")
 
 if __name__ == "__main__":
     main()
