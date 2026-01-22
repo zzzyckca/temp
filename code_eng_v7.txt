@@ -3,44 +3,44 @@ import socket
 
 def test_imap_connection(server, port, username, password):
     try:
-        print(f"正在嘗試連線至 {server}:{port}...")
-        
-        # 1. 建立 SSL 連線 (通常 IMAP 走 SSL 是 Port 993)
-        # 如果你的 server 不用 SSL (極少見)，請改用 imaplib.IMAP4(server, port)
+        print(f"Attempting to connect to {server}:{port}...")
+        
+        # 1. Establish SSL connection (IMAP usually uses SSL on Port 993)
+        # If your server does not use SSL (rare), use imaplib.IMAP4(server, port) instead
         mail = imaplib.IMAP4_SSL(host=server, port=port)
-        
-        print("連線成功，正在嘗試登入...")
+        
+        print("Connection successful, attempting to login...")
 
-        # 2. 嘗試登入
+        # 2. Attempt to login
         mail.login(username, password)
-        
-        print("✅ 登入成功！(Login Successful)")
-        print(f"Server 回應: {mail.welcome}")
+        
+        print("✅ Login Successful!")
+        print(f"Server Response: {mail.welcome}")
 
-        # 3. 登出並關閉連線
+        # 3. Logout and close connection
         mail.logout()
         return True
 
     except imaplib.IMAP4.error as e:
-        print(f"❌ 登入失敗 (Authentication Failed): {e}")
+        print(f"❌ Login Failed (Authentication Failed): {e}")
         return False
     except socket.gaierror:
-        print("❌ 找不到伺服器 (DNS Error) - 請檢查 Server 地址")
+        print("❌ Server not found (DNS Error) - Check Server Address")
         return False
     except socket.timeout:
-        print("❌ 連線逾時 (Timeout) - Server 沒有回應")
+        print("❌ Connection Timeout - Server did not respond")
         return False
     except Exception as e:
-        print(f"❌ 發生未預期的錯誤: {e}")
+        print(f"❌ Unexpected Error: {e}")
         return False
 
-# --- 設定你的資訊 ---
-# 例如 Gmail 是 'imap.gmail.com', Outlook 是 'outlook.office365.com'
-IMAP_SERVER = 'imap.example.com' 
-IMAP_PORT = 993 # SSL 通常是 993
+# --- Configuration ---
+# e.g., Gmail is 'imap.gmail.com', Outlook is 'outlook.office365.com'
+IMAP_SERVER = 'imap.example.com' 
+IMAP_PORT = 993 # SSL is usually 993
 EMAIL_USER = 'your_email@example.com'
 EMAIL_PASS = 'your_password'
 
-# --- 執行測試 ---
+# --- Execute Test ---
 if __name__ == "__main__":
     test_imap_connection(IMAP_SERVER, IMAP_PORT, EMAIL_USER, EMAIL_PASS)
