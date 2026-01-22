@@ -1,298 +1,156 @@
-import win32com.client
-import os
-import shutil
 import pandas as pd
-import pythoncom
-from datetime import datetime
+from TM1py import TM1Service
 
 # ==========================================
-# 1. CONFIGURATION & SETUP
+# 1. 設定區域 (Configuration)
 # ==========================================
-# The specific account to monitor. Must match the Outlook display name exactly.
-TARGET_ACCOUNT_NAME = "data.team@rbc.com"
+EXCEL_FILE = 'input_params.xlsx'       
+OUTPUT_FILE = 'final_result_linear.csv'  
 
-# Local File System Paths
-CONFIG_FILE_PATH = r"C:\Work\config.xlsx"   # Excel rule file
-TEMP_FOLDER = r"C:\temp3"                   # Staging area for downloads
-DEFAULT_FOLDER = r"C:\temp4"                # Fallback destination if no rule matches
+# Python 自動填入的時間
+DERIVED_TIME_PERIOD = 'F2026.01' 
 
-# Database Configuration
-# ⚠️ REPLACE THIS with your actual SQLAlchemy engine object before running
-# Example: create_engine('mssql+pyodbc://user:pwd@host/db?driver=ODBC+Driver+17+for+SQL+Server')
-create_engine = "REPLACE_WITH_REAL_ENGINE_OBJECT" 
-DB_TABLE_NAME = "Email_Automation_Logs"
+# TM1 連線資訊
+TM1_CONFIG = {
+    'address': 'localhost',  # 🔑 IP
+    'port': 12345,           # 🔑 HTTPPort
+    'user': 'admin',
+    'password': 'password',
+    'ssl': True
+}
 
-# Ensure all necessary local directories exist to prevent 'PathNotFound' errors
-for f in [TEMP_FOLDER, DEFAULT_FOLDER]:
-    os.makedirs(f, exist_ok=True)
-
+CUBE_NAME = "cb_reporting" 
 
 # ==========================================
-# 2. HELPER FUNCTIONS
+# 2. 讀取 Excel 並強力清洗 (Fix Duplicate Columns)
 # ==========================================
+print("--- 1. 讀取 Excel ---")
+df_master = pd.read_excel(EXCEL_FILE)
+df_master = df_master.astype(str)
 
-def get_target_inbox(account_name):
-    """
-    Connects to the Outlook MAPI namespace and retrieves the 'Inbox' folder
-    for a specific account name.
-    
-    Args:
-        account_name (str): The display name of the email account (e.g., 'data.team@rbc.com')
-    
-    Returns:
-        Outlook.MAPIFolder: The Inbox folder object, or None if not found.
-    """
-    # Initialize COM library. Critical for thread safety if this script is run via task scheduler or Prefect.
-    pythoncom.CoInitialize()
-    
-    outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    
-    # Loop through all root folders (Accounts) to find the match
-    for folder in outlook.Folders:
-        # Case-insensitive comparison for robustness
-        if folder.Name.lower() == account_name.lower():
-            try:
-                # Direct access to 'Inbox' as requested (assuming English environment)
-                return folder.Folders("Inbox")
-            except Exception as e:
-                print(f"❌ Account '{account_name}' found, but 'Inbox' folder is missing: {e}")
-                return None
-                
-    print(f"❌ Could not find any account matching: {account_name}")
-    return None
+# 🔥 轉細楷 + 去除前後空白
+df_master.columns = df_master.columns.str.lower().str.strip()
 
-
-def load_config_rules():
-    """
-    Reads the automation rules from Excel.
-    
-    Expected Columns:
-    - Subject_Keyword: Substring to look for in Email Subject.
-    - Attachment_Keyword: Substring to look for in Filename.
-    - File_Extension: Specific file type (e.g., '.pdf').
-    - Destination_Folder: Where to move the file.
-    """
-    try:
-        df = pd.read_excel(CONFIG_FILE_PATH)
-        
-        # Data Cleaning: Fill NaN with empty strings to prevent 'float' errors during string comparison
-        df.fillna("", inplace=True)
-        
-        # Validation: Ensure all required columns exist
-        expected_cols = ['Subject_Keyword', 'Attachment_Keyword', 'File_Extension', 'Destination_Folder']
-        for col in expected_cols:
-            if col not in df.columns:
-                # Add missing column with empty values to prevent KeyError later
-                df[col] = "" 
-        
-        # Convert to list of dictionaries for faster iteration
-        rules = df.to_dict('records')
-        print(f"📋 Loaded {len(rules)} rules from {CONFIG_FILE_PATH}")
-        return rules
-        
-    except Exception as e:
-        print(f"❌ Critical Error: Failed to load config excel. Reason: {e}")
-        return []
-
-
-def process_attachments(msg, rules, logs_list):
-    """
-    Core Logic:
-    1. Iterates through all attachments in a single email.
-    2. Downloads them to a temp folder.
-    3. Matches them against Excel rules.
-    4. Moves them to the final destination.
-    5. Appends execution details to 'logs_list'.
-    """
-    # Safety Check: Skip if no attachments
-    if msg.Attachments.Count == 0:
-        return
-
-    # Attempt to get sender name, handle cases where property might be missing (e.g., system notifications)
-    try:
-        sender_name = msg.SenderName
-    except:
-        sender_name = "Unknown"
-
-    # Iterate through attachments (Outlook index starts at 1)
-    for i in range(1, msg.Attachments.Count + 1):
-        attachment = msg.Attachments.Item(i)
-        filename = attachment.FileName
-        
-        # --- PHASE 1: DOWNLOAD TO TEMP ---
-        # win32com requires an absolute path to save files. We use a temp folder first
-        # to ensure we have the file on disk before trying to move it to a potentially network drive.
-        temp_path = os.path.join(TEMP_FOLDER, filename)
-        
-        try:
-            attachment.SaveAsFile(temp_path)
-        except Exception as e:
-            print(f"   ❌ Failed to save attachment '{filename}': {e}")
-            # Log the failure
-            logs_list.append({
-                "Execution_Time": datetime.now(),
-                "Email_Subject": msg.Subject,
-                "Sender": sender_name,
-                "Attachment": filename,
-                "Status": "Failed (Save)",
-                "Destination": "",
-                "Matched_Rule": str(e)
-            })
-            continue # Skip to next attachment
-
-        # --- PHASE 2: MATCH RULES ---
-        destination = DEFAULT_FOLDER
-        matched_rule_info = "Default (No Match)"
-
-        for rule in rules:
-            # Normalize inputs to lowercase for consistent matching
-            r_subj = str(rule.get('Subject_Keyword', '')).strip().lower()
-            r_att  = str(rule.get('Attachment_Keyword', '')).strip().lower()
-            r_ext  = str(rule.get('File_Extension', '')).strip().lower() 
-            r_dest = rule.get('Destination_Folder')
-
-            # Logic: Match Subject AND Filename AND Extension
-            match_subject = r_subj in msg.Subject.lower()
-            match_filename = r_att in filename.lower()
-            
-            # Handle Extension: If rule is empty, accept any extension
-            match_ext = filename.lower().endswith(r_ext) if r_ext else True
-
-            if match_subject and match_filename and match_ext:
-                destination = r_dest
-                matched_rule_info = f"Rule: Subj='{r_subj}', Ext='{r_ext}'"
-                break # Stop searching, we found the highest priority rule
-
-        # --- PHASE 3: MOVE TO DESTINATION ---
-        try:
-            # Ensure destination folder exists (Create it if missing)
-            os.makedirs(destination, exist_ok=True)
-            
-            final_path = os.path.join(destination, filename)
-            
-            # Move the file (Overwrite if exists - standard shutil behavior)
-            shutil.move(temp_path, final_path)
-            
-            print(f"   ✅ Processed: {filename} -> {destination}")
-            
-            # Log Success
-            logs_list.append({
-                "Execution_Time": datetime.now(),
-                "Email_Subject": msg.Subject,
-                "Sender": sender_name,
-                "Attachment": filename,
-                "Status": "Success",
-                "Destination": final_path,
-                "Matched_Rule": matched_rule_info
-            })
-            
-        except Exception as e:
-            print(f"   ❌ Failed to move file to {destination}: {e}")
-            # Log Failure
-            logs_list.append({
-                "Execution_Time": datetime.now(),
-                "Email_Subject": msg.Subject,
-                "Sender": sender_name,
-                "Attachment": filename,
-                "Status": "Failed (Move)",
-                "Destination": destination,
-                "Matched_Rule": str(e)
-            })
-
+# 🔥 關鍵修復: 移除重複的 Header (例如有兩個 measure)
+df_master = df_master.loc[:, ~df_master.columns.duplicated()]
+print(f"Excel Columns: {df_master.columns.tolist()}")
 
 # ==========================================
-# 3. MAIN EXECUTION FLOW
+# 3. 插入 Time_Period
 # ==========================================
+print(f"--- 2. 插入 Time_Period: {DERIVED_TIME_PERIOD} ---")
+df_master['time_period'] = DERIVED_TIME_PERIOD
 
-def run_email_processor():
-    print("🚀 Starting Email Automation Script...")
-    
-    # 1. Load Rules
-    rules = load_config_rules()
-    if not rules:
-        print("⚠️ Stopping: No rules loaded.")
-        return
+# ==========================================
+# 4. 定義 Mapping (全細楷)
+# ==========================================
+# 左邊 Key 跟 Excel Header，右邊 Value 跟 TM1 Dimension
+MEASURE_COL_EXCEL = 'measure'
+MEASURE_DIM_TM1   = 'measure'
 
-    # 2. Connect to Outlook
-    inbox = get_target_inbox(TARGET_ACCOUNT_NAME)
-    if not inbox: 
-        print("⚠️ Stopping: Inbox not found.")
-        return
+ROW_DIM_MAPPING = {
+    'account':                      'account',
+    'operating_unit':               'operating_unit',
+    'scenario':                     'scenario',
+    'time_period':                  'time_period', # 剛加進去的
+    'currency':                     'currency',
+    'currency_display':             'currency_display',
+    'project':                      'project',
+    'product':                      'product',
+    'channel':                      'channel',
+    'segment':                      'segment',
+    'gaap':                         'gaap',
+    'counter_party_operating_unit': 'counter_party_operating_unit',
+    'amt_type':                     'amt_type'
+}
 
-    # 3. Retrieve Unread Emails
-    # We restrict the query to the server side for performance
-    items = inbox.Items.Restrict("[UnRead] = True")
-    items.Sort("[ReceivedTime]", True) # Sort by Newest First
+# ==========================================
+# 5. 動態組裝 MDX (Inline Logic)
+# ==========================================
+print("--- 3. 組裝 MDX ---")
 
-    print(f"🔍 Found {items.Count} unread emails. Scanning for relevant subjects...")
+# A. 處理 Measure (Columns 軸)
+# 直接用 List Comprehension 轉 MDX Set 格式
+unique_measures = [str(x) for x in df_master[MEASURE_COL_EXCEL].unique() if pd.notna(x) and str(x).strip() != '']
+str_measures = "{" + ",".join([f"[{MEASURE_DIM_TM1}].[{item}]" for item in unique_measures]) + "}"
 
-    processed_count = 0
-    audit_logs = [] # Initialize empty list for logging
-    
-    # ⚠️ CRITICAL: We use list(items) to create a snapshot of the emails.
-    # Why? modifying the collection (e.g., changing UnRead status) while iterating 
-    # directly over the 'items' COM object can cause index shifting and skip emails.
-    for msg in list(items):
-        try:
-            # --- Step A: Relevance Check (Optimization) ---
-            # Don't download attachments if the subject doesn't match ANY rule.
-            is_relevant = False
-            for rule in rules:
-                rule_subj = str(rule.get('Subject_Keyword', '')).strip().lower()
-                # Check if rule subject keyword is present in email subject
-                if rule_subj and rule_subj in msg.Subject.lower():
-                    is_relevant = True
-                    break
-            
-            if not is_relevant:
-                # Skip irrelevant emails entirely
-                continue
+# B. 處理 Rows 軸 (其他維度)
+row_mdx_parts = []
+for excel_col, tm1_dim in ROW_DIM_MAPPING.items():
+    if excel_col in df_master.columns:
+        # 轉 MDX Set
+        unique_items = [str(x) for x in df_master[excel_col].unique() if pd.notna(x) and str(x).strip() != '']
+        if unique_items:
+            mdx_set = "{" + ",".join([f"[{tm1_dim}].[{item}]" for item in unique_items]) + "}"
+            row_mdx_parts.append(mdx_set)
 
-            # --- Step B: Process Attachments ---
-            print(f"📧 processing Relevant Email: {msg.Subject}")
-            process_attachments(msg, rules, audit_logs)
-            
-            # --- Step C: Mark as Read ---
-            # As per requirement: If subject matches, mark read regardless of attachment outcome
-            msg.UnRead = False
-            msg.Save() # Explicitly save the change state
-            processed_count += 1
-            print("   ✨ Marked as Read.")
+row_mdx_str = " * ".join(row_mdx_parts)
 
-        except Exception as e:
-            print(f"⚠️ Error processing email object: {e}")
+# C. 完整 MDX
+mdx_query = f"""
+SELECT
+    {str_measures} ON COLUMNS,
+    NON EMPTY
+    ( {row_mdx_str} ) ON ROWS
+FROM [{CUBE_NAME}]
+"""
 
-    # ==========================================
-    # 4. LOGGING & DATABASE UPLOAD
-    # ==========================================
-    print(f"\n🏁 Batch Finished. Total Emails Processed: {processed_count}")
+# ==========================================
+# 6. 執行查詢
+# ==========================================
+print("--- 4. 連線 TM1 ---")
+df_tm1 = pd.DataFrame() # 初始化空 DataFrame 以防連線失敗
 
-    # Only attempt upload if there are actual logs
-    if processed_count >= 1 and len(audit_logs) > 0:
-        print("📊 Preparing Audit Logs...")
-        
-        df_log = pd.DataFrame(audit_logs)
-        
-        # Print sample to console for quick verification
-        print("--- Log Preview ---")
-        print(df_log.head(3)) 
-        print(f"Total Records: {len(df_log)}")
+with TM1Service(**TM1_CONFIG) as tm1:
+    df_tm1 = tm1.cells.execute_mdx_dataframe(mdx_query)
+    # Reset Index
+    df_tm1 = df_tm1.reset_index()
+    # 清洗 TM1 回傳的 Columns
+    df_tm1.columns = df_tm1.columns.str.lower().str.strip()
+    print(f"TM1 回傳行數: {len(df_tm1)}")
 
-        # --- DB Upload ---
-        try:
-            print(f"⏳ Uploading to Database Table: {DB_TABLE_NAME}...")
-            
-            # Using 'append' to add new rows without deleting old history
-            # index=False ensures we don't upload the Pandas row numbers
-            df_log.to_sql(DB_TABLE_NAME, con=create_engine, if_exists='append', index=False)
-            
-            print("✅ Database Upload Successful.")
-            
-        except Exception as db_err:
-            print(f"❌ DATABASE UPLOAD FAILED: {db_err}")
-            print("💡 Check your 'create_engine' object and network connection.")
-    else:
-        print("ℹ️ No relevant activity to log this run.")
+# ==========================================
+# 7. 數據處理 (Melt & Merge)
+# ==========================================
+if not df_tm1.empty:
+    print("--- 5. 整理數據 ---")
+    
+    # A. 準備 ID Vars (找出非 Measure Value 的欄位)
+    excel_measure_values = [x.lower() for x in df_master[MEASURE_COL_EXCEL].unique()]
+    id_vars = [col for col in df_tm1.columns if col not in excel_measure_values]
 
-if __name__ == "__main__":
-    run_email_processor()
+    # B. Melt (轉直) - 🔥 避開撞名，用 'measure_temp'
+    df_tm1_long = df_tm1.melt(
+        id_vars=id_vars, 
+        var_name='measure_temp',  # <--- 暫時改名
+        value_name='tm1_value' 
+    )
+    
+    # 確保全部 String 格式
+    for col in df_tm1_long.columns:
+         df_tm1_long[col] = df_tm1_long[col].astype(str)
+
+    # C. 準備 Merge Keys
+    left_keys = list(ROW_DIM_MAPPING.keys()) + [MEASURE_COL_EXCEL]
+    right_keys = list(ROW_DIM_MAPPING.values()) + ['measure_temp'] # 對應上面的 temp 名
+
+    # D. Left Join
+    final_df = pd.merge(
+        df_master,
+        df_tm1_long,
+        how='left',
+        left_on=left_keys,
+        right_on=right_keys
+    )
+
+    # E. 填補 0
+    final_df['tm1_value'] = final_df['tm1_value'].fillna(0)
+    
+    # F. 輸出
+    final_df.to_csv(OUTPUT_FILE, index=False)
+    print(f"🎉 完成！File: {OUTPUT_FILE}")
+
+else:
+    print("⚠️ TM1 無數據，填 0 輸出。")
+    df_master['tm1_value'] = 0
+    df_master.to_csv(OUTPUT_FILE, index=False)
