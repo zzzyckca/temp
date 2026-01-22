@@ -1,0 +1,160 @@
+import pandas as pd
+from TM1py import TM1Service
+
+# ==========================================
+# 1. 設定區域
+# ==========================================
+EXCEL_FILE = 'input_params.xlsx'       
+OUTPUT_FILE = 'final_result_direct_join.csv'  
+DERIVED_TIME_PERIOD = 'F2026.01' 
+
+TM1_CONFIG = {
+    'address': 'localhost',
+    'port': 12345,
+    'user': 'admin',
+    'password': 'password',
+    'ssl': True
+}
+CUBE_NAME = "cb_reporting" 
+
+# ==========================================
+# 2. 讀取與清洗 Excel
+# ==========================================
+print("--- 1. 讀取 Excel ---")
+df_master = pd.read_excel(EXCEL_FILE)
+df_master = df_master.astype(str)
+df_master.columns = df_master.columns.str.lower().str.strip() # 轉細楷
+df_master = df_master.loc[:, ~df_master.columns.duplicated()] # 移除重複欄位
+
+# ==========================================
+# 3. 插入 Time Period
+# ==========================================
+print(f"--- 2. 插入 Time: {DERIVED_TIME_PERIOD} ---")
+df_master['time_period'] = DERIVED_TIME_PERIOD
+
+# ==========================================
+# 4. 定義 Mapping (全細楷)
+# ==========================================
+# 假設你的 Excel 有一欄叫 measure，TM1 也有一個維度叫 measure
+MEASURE_COL = 'measure'
+TM1_MEASURE_DIM = 'measure'
+
+ROW_DIM_MAPPING = {
+    'account':                      'account',
+    'operating_unit':               'operating_unit',
+    'scenario':                     'scenario',
+    'time_period':                  'time_period',
+    'currency':                     'currency',
+    'currency_display':             'currency_display',
+    'project':                      'project',
+    'product':                      'product',
+    'channel':                      'channel',
+    'segment':                      'segment',
+    'gaap':                         'gaap',
+    'counter_party_operating_unit': 'counter_party_operating_unit',
+    'amt_type':                     'amt_type',
+    'measure':                      'measure' # 🔥 直接將 Measure 當作普通維度處理
+}
+
+# ==========================================
+# 5. 組裝 MDX
+# ==========================================
+print("--- 3. 組裝 MDX ---")
+
+# 這裡我們將 Measure 放去 Rows 軸和其他維度一起 CrossJoin
+# 這樣 TM1py 回傳的 DataFrame 就會係: [Account, Dept, ..., Measure, Value]
+# 這就是你要的格式，不需要再 Melt
+row_mdx_parts = []
+for excel_col, tm1_dim in ROW_DIM_MAPPING.items():
+    if excel_col in df_master.columns:
+        unique_items = [str(x) for x in df_master[excel_col].unique() if pd.notna(x) and str(x).strip() != '']
+        if unique_items:
+            # 建立 Set: {[Dim].[Item1], [Dim].[Item2]}
+            mdx_set = "{" + ",".join([f"[{tm1_dim}].[{item}]" for item in unique_items]) + "}"
+            row_mdx_parts.append(mdx_set)
+
+row_mdx_str = " * ".join(row_mdx_parts)
+
+# 為了讓 TM1py 回傳 Tidy Format (長表)，我們通常把所有維度放 Rows
+# Columns 只放一個 Dummy 或者空的
+mdx_query = f"""
+SELECT
+    {{ }} ON COLUMNS, 
+    NON EMPTY
+    ( {row_mdx_str} ) ON ROWS
+FROM [{CUBE_NAME}]
+"""
+
+# ==========================================
+# 6. 執行查詢
+# ==========================================
+print("--- 4. 連線 TM1 ---")
+df_tm1 = pd.DataFrame()
+
+with TM1Service(**TM1_CONFIG) as tm1:
+    # 使用 execute_mdx_dataframe (預設已經會幫你由 MDX table 轉做 pandas dataframe)
+    df_tm1 = tm1.cells.execute_mdx_dataframe(mdx_query)
+    
+    # Reset Index: 把 Dimensions 變成普通 Columns
+    df_tm1 = df_tm1.reset_index()
+    
+    # 轉細楷
+    df_tm1.columns = df_tm1.columns.str.lower().str.strip()
+    
+    # 🔥 關鍵檢查：印出 TM1 回傳的 Columns 看看
+    print(f"TM1 Columns: {df_tm1.columns.tolist()}")
+    # 預期結果: ['account', 'operating_unit', ..., 'measure', 'value']
+
+# ==========================================
+# 7. 直接 Merge (No Melt)
+# ==========================================
+if not df_tm1.empty:
+    print("--- 5. 直接 Merge ---")
+    
+    # 找出數值欄位 (通常叫 'value' 或 'values')
+    # 我們把它改名做 'tm1_value' 避免撞名
+    value_col = None
+    for col in ['value', 'values']:
+        if col in df_tm1.columns:
+            value_col = col
+            break
+            
+    if value_col:
+        df_tm1.rename(columns={value_col: 'tm1_value'}, inplace=True)
+    else:
+        # 如果找不到 value column，可能全部都係維度名，最後一個可能係數值
+        # 這裡做一個防守性 logic
+        df_tm1.rename(columns={df_tm1.columns[-1]: 'tm1_value'}, inplace=True)
+
+    # 確保全部 String (除了數值)
+    for col in df_tm1.columns:
+        if col != 'tm1_value':
+            df_tm1[col] = df_tm1[col].astype(str)
+
+    # 準備 Keys (左右兩邊既 Keys 應該要一樣)
+    # 這裡直接用 Mapping 的 Keys，因為我們假設 TM1py 回傳的 column names 等於 Dimension names (細楷)
+    join_keys = list(ROW_DIM_MAPPING.values())
+    
+    # 再次確認這些 Keys 真的存在於 df_tm1 中
+    valid_join_keys = [k for k in join_keys if k in df_tm1.columns]
+
+    print(f"用作 Join 的 Keys: {valid_join_keys}")
+
+    # Left Join
+    final_df = pd.merge(
+        df_master,
+        df_tm1,
+        how='left',
+        on=valid_join_keys # 因為左右名一樣 (細楷)，直接用 on 就得
+    )
+
+    # 填補 0
+    final_df['tm1_value'] = final_df['tm1_value'].fillna(0)
+    
+    final_df.to_csv(OUTPUT_FILE, index=False)
+    print(f"🎉 完成！File: {OUTPUT_FILE}")
+
+else:
+    print("⚠️ TM1 無數據，填 0 輸出。")
+    df_master['tm1_value'] = 0
+    df_master.to_csv(OUTPUT_FILE, index=False)
