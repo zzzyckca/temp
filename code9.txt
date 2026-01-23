@@ -2,15 +2,12 @@ import pandas as pd
 from TM1py import TM1Service
 
 # ==========================================
-# 1. 設定區域
+# 1. Connection and File Configuration
 # ==========================================
-# 你的 Excel 檔案 (只有 Parameters，沒有 Value)
-EXCEL_FILE = 'input_params.xlsx'       
-OUTPUT_FILE = 'final_result_joined.csv'
+EXCEL_FILE = 'input_params.xlsx'       
+OUTPUT_FILE = 'final_result_dynamic.csv'
 
-# 硬性規定的 Time Period
-DERIVED_TIME_PERIOD = 'F2026.01' 
-
+# TM1 Connection Settings
 TM1_CONFIG = {
     'address': 'localhost',
     'port': 12345,
@@ -18,78 +15,64 @@ TM1_CONFIG = {
     'password': 'password',
     'ssl': True
 }
-CUBE_NAME = "cb_reporting" 
+CUBE_NAME = "cb_reporting" 
 
 # ==========================================
-# 2. 準備 Excel Parameters
+# 2. Read Excel & Auto-classify Dimensions
 # ==========================================
-print("--- 1. 讀取並整理 Excel Parameters ---")
+print("--- 1. Reading Excel ---")
 df_master = pd.read_excel(EXCEL_FILE)
 df_master = df_master.astype(str)
 
-# 1. 全部轉細楷 + 去空格 (這是最穩陣的 Join 方法)
+# Clean Headers: Convert to lowercase + strip whitespace
+# This ensures column names match TM1 dimension names (case-insensitive)
 df_master.columns = df_master.columns.str.lower().str.strip()
 
-# 2. 強制移除重複欄位 (解決 'label not unique' 的根源)
+# Remove duplicate columns if any
 df_master = df_master.loc[:, ~df_master.columns.duplicated()]
 
-# 3. 插入 Time Period
-df_master['time_period'] = DERIVED_TIME_PERIOD.lower() # 保持細楷一致性
+print(f"All Excel Columns: {df_master.columns.tolist()}")
 
-# 4. 確保 Excel 裡的內容也是 clean 的 string
-# 特別是 measure 這一欄，因為它是 MDX 的關鍵
-if 'measure' in df_master.columns:
-    df_master['measure'] = df_master['measure'].str.strip()
+# 🔥 Core Logic: Verify 'measure' column exists
+if 'measure' not in df_master.columns:
+    raise ValueError("❌ Error: Column [measure] not found in Excel! Please ensure Excel Header contains 'measure'.")
 
-print(f"Excel Columns (Join Keys): {df_master.columns.tolist()}")
+# A. Separate Measure and Row Dimensions
+measure_col = 'measure'
 
-# ==========================================
-# 3. 定義 Mapping
-# ==========================================
-# 根據你的 MDX 結構：Measure on Columns, 其他 on Rows
-MEASURE_COL = 'measure'
+# Logic: All columns in Excel EXCEPT 'measure' are treated as Row Dimensions
+# Since 'time_period' is now in Excel, it is automatically included here.
+row_dims = [col for col in df_master.columns if col != measure_col]
 
-# 這裡列出所有放在 ROWS 的維度
-ROW_DIM_MAPPING = {
-    'account':                      'account',
-    'operating_unit':               'operating_unit',
-    'scenario':                     'scenario',
-    'time_period':                  'time_period',
-    'currency':                     'currency',
-    'currency_display':             'currency_display',
-    'project':                      'project',
-    'product':                      'product',
-    'channel':                      'channel',
-    'segment':                      'segment',
-    'gaap':                         'gaap',
-    'counter_party_operating_unit': 'counter_party_operating_unit',
-    'amt_type':                     'amt_type'
-}
+print(f"👉 Measure Axis (Columns): ['{measure_col}']")
+print(f"👉 Row Axis     (Rows)   : {row_dims}")
 
 # ==========================================
-# 4. 動態組裝 MDX (On Columns / On Rows)
+# 3. Dynamically Assemble MDX
 # ==========================================
-print("--- 2. 組裝 MDX ---")
+print("--- 2. Assembling MDX ---")
 
-# A. 處理 Measure (ON COLUMNS)
-# 抓出 Excel 裡 unique 的 measure (例如 Mx_2)
-unique_measures = [x for x in df_master[MEASURE_COL].unique() if x and x.lower() != 'nan']
-# 假設 TM1 維度名也是 measure
+# A. Measure (On 0 / Columns)
+unique_measures = [x for x in df_master[measure_col].unique() if x]
+# Assuming TM1 Dimension name for measure is 'measure'
 str_measures = "{" + ",".join([f"[measure].[{item}]" for item in unique_measures]) + "}"
 
-# B. 處理 其他維度 (ON ROWS)
+# B. Rows (On 1 / Rows) - All remaining columns (Account, Time, Dept, etc.)
 row_mdx_parts = []
-for excel_col, tm1_dim in ROW_DIM_MAPPING.items():
-    if excel_col in df_master.columns:
-        unique_items = [x for x in df_master[excel_col].unique() if x and x.lower() != 'nan']
-        if unique_items:
-            mdx_set = "{" + ",".join([f"[{tm1_dim}].[{item}]" for item in unique_items]) + "}"
-            row_mdx_parts.append(mdx_set)
+for dim in row_dims:
+    # Get unique items for this dimension from the Excel column
+    unique_items = [x for x in df_master[dim].unique() if x]
+    
+    if unique_items:
+        # Syntax: [Dimension].[Element]
+        # This works for Time_Period too (e.g., [time_period].[2025.01])
+        mdx_set = "{" + ",".join([f"[{dim}].[{item}]" for item in unique_items]) + "}"
+        row_mdx_parts.append(mdx_set)
 
+# CrossJoin all row dimensions
 row_mdx_str = " * ".join(row_mdx_parts)
 
-# C. 完整 MDX (保留你想要的結構)
-# 注意：這裡 ON 0 是 Columns, ON 1 是 Rows
+# Construct Full MDX Query
 mdx_query = f"""
 SELECT
     {str_measures} ON 0,
@@ -97,85 +80,64 @@ SELECT
 FROM [{CUBE_NAME}]
 """
 
+# print(mdx_query) # Uncomment for debugging
+
 # ==========================================
-# 5. 執行查詢
+# 4. Execute Query & Merge
 # ==========================================
-print("--- 3. 連線 TM1 執行查詢 ---")
+print("--- 3. Executing Query ---")
 df_tm1 = pd.DataFrame()
 
 with TM1Service(**TM1_CONFIG) as tm1:
     df_tm1 = tm1.cells.execute_mdx_dataframe(mdx_query)
-    
-    # 1. Reset Index (把 Dimensions 變成普通 Columns)
+    
+    # Reset Index & Clean Headers
     df_tm1 = df_tm1.reset_index()
-    
-    # 2. 轉細楷 (確保同 Excel 一樣)
     df_tm1.columns = df_tm1.columns.str.lower().str.strip()
-    
-    print(f"TM1 Columns: {df_tm1.columns.tolist()}")
 
-# ==========================================
-# 6. 整理數據 & Join (關鍵一步)
-# ==========================================
 if not df_tm1.empty:
-    print("--- 4. 整理數據 & Merge ---")
-
-    # [情境分析]
-    # 當 Measure 在 Columns 時，TM1py 回傳的結果，數值欄位名稱通常就是那個 Measure 的名字 (例如 'mx_2' 或 'value')
-    # 你的截圖顯示回傳了 'Value'。
-    
-    # 1. 找出數值欄位並改名做 'tm1_value'
-    # 這樣可以避免跟 Excel 原本的欄位撞名
+    print("--- 4. Merge Data ---")
+    
+    # 1. Identify Value Column and rename to 'tm1_value'
     target_val_col = None
-    
-    # 優先找 'value', 'values'
+    
+    # Priority 1: Check for 'value' or 'values'
     for col in ['value', 'values']:
-        if col in df_tm1.columns:
-            target_val_col = col
-            break
-            
-    # 如果找不到，就找 measure 的名字 (例如 mx_2)
+        if col in df_tm1.columns: target_val_col = col; break
+    
+    # Priority 2: Check for specific measure names (e.g., mx_2)
     if not target_val_col:
         for m in unique_measures:
-            if m.lower() in df_tm1.columns:
-                target_val_col = m.lower()
-                break
-    
-    # 如果還是找不到，拿最後一欄當作數值
-    if not target_val_col:
-         target_val_col = df_tm1.columns[-1]
+            if m.lower() in df_tm1.columns: target_val_col = m.lower(); break
+            
+    # Priority 3: Fallback to the last column
+    if not target_val_col: target_val_col = df_tm1.columns[-1]
 
-    print(f"鎖定數值欄位: {target_val_col} -> 改名為 'tm1_value'")
     df_tm1.rename(columns={target_val_col: 'tm1_value'}, inplace=True)
 
-    # 2. 準備 Join Keys
-    # 我們只用 Dimensions 來對接 (Account, Org...)
-    # 這樣可以避開 'measure' 這一欄的混亂
-    join_keys = [col for col in ROW_DIM_MAPPING.keys() if col in df_master.columns]
-    
-    # 確保兩邊的 Join Keys 都是 String 格式
+    # 2. Prepare Join Keys
+    # We join using all Row Dimensions present in the returned data
+    join_keys = [d for d in row_dims if d in df_tm1.columns]
+    
+    # Ensure all keys are strings for safe merging
     for col in join_keys:
-        if col in df_tm1.columns:
-            df_tm1[col] = df_tm1[col].astype(str)
+        df_tm1[col] = df_tm1[col].astype(str)
 
-    # 3. 執行 Left Join
-    # Excel 是主表，TM1 是查表
+    # 3. Perform Left Join
+    # Master (Excel) Left Join TM1 Data
     final_df = pd.merge(
         df_master,
-        df_tm1[join_keys + ['tm1_value']], # 只取需要的欄位 Merge，避免帶入多餘的 columns
+        df_tm1[join_keys + ['tm1_value']],
         how='left',
         on=join_keys
     )
-
-    # 4. 填補空值
+    
+    # Fill NaN values with 0
     final_df['tm1_value'] = final_df['tm1_value'].fillna(0)
-    
-    print("Sample Result:")
-    print(final_df.head())
-    
+    
     final_df.to_csv(OUTPUT_FILE, index=False)
-    print(f"🎉 成功！檔案已儲存: {OUTPUT_FILE}")
+    print(f"🎉 Success! Results saved to: {OUTPUT_FILE}")
+    print(final_df.head())
 
 else:
-    print("⚠️ TM1 回傳空數據，請檢查 MDX 或權限。")
-
+    print("⚠️ No results found (Check if Excel data matches Cube dimensions).")
