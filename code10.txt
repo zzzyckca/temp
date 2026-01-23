@@ -1,0 +1,88 @@
+import pandas as pd
+from TM1py import TM1Service
+
+# ==========================================
+# 1. 設定區域
+# ==========================================
+TM1_CONFIG = {
+    'address': 'localhost',
+    'port': 12345,
+    'user': 'admin',
+    'password': 'password',
+    'ssl': True
+}
+
+# 🔥 你想查邊個維度？
+TARGET_DIMENSION = 'Account'  
+
+# 🔥 你想查邊個 Parent (e.g., account_type 或 Total Account)？
+TARGET_PARENT = 'Net Income'  
+
+# ==========================================
+# 2. 執行查詢
+# ==========================================
+print(f"正在查詢 [{TARGET_DIMENSION}] 維度中的 [{TARGET_PARENT}] ...")
+
+try:
+    with TM1Service(**TM1_CONFIG) as tm1:
+        
+        # --- 0. 檢查是否存在 ---
+        if not tm1.elements.exists(TARGET_DIMENSION, TARGET_DIMENSION, TARGET_PARENT):
+            print(f"❌ 找不到元素: [{TARGET_PARENT}]。請檢查拼字或大小寫。")
+        else:
+            print("✅ 元素存在，開始分析架構...\n")
+
+            # ==========================================
+            # A. 查直屬下一層 (Direct Children)
+            # ==========================================
+            # 這只會顯示「下一級」是什麼
+            children = tm1.elements.get_component_names(
+                dimension_name=TARGET_DIMENSION, 
+                hierarchy_name=TARGET_DIMENSION, 
+                element_name=TARGET_PARENT
+            )
+            
+            print(f"--- 1. 直屬下一層 (Direct Children) 共 {len(children)} 個 ---")
+            if children:
+                df_children = pd.DataFrame(children, columns=['Child_Element'])
+                print(df_children)
+            else:
+                print("(沒有下一層，這是最底層元素)")
+
+            print("\n" + "="*30 + "\n")
+
+            # ==========================================
+            # B. 查所有最底層 (All Descendants / Leaves)
+            # ==========================================
+            # 這會「一直拆一直拆」，直到拆出所有 Level 0 (最底層) 的元素
+            # 適合用來找：這個大數包含了哪些最細的 Item (如 USD, CAD)
+            
+            mdx = f"""
+            SELECT
+                {{Tm1FilterByLevel(
+                    {{Tm1DrillDownMember(
+                        {{[{TARGET_DIMENSION}].[{TARGET_PARENT}]}}, 
+                        ALL, 
+                        RECURSIVE
+                    )}}, 
+                    0
+                )}} ON ROWS,
+                {{ }} ON COLUMNS
+            FROM [{TARGET_DIMENSION}]
+            """
+            
+            # 使用 execute_mdx (不是 dataframe) 來只抓元素名
+            leaves = tm1.elements.execute_mdx(mdx, TARGET_DIMENSION)
+            
+            print(f"--- 2. 所有最底層項目 (All Leaves) 共 {len(leaves)} 個 ---")
+            if leaves:
+                # 這裡只列出前 20 個，避免洗版
+                df_leaves = pd.DataFrame(leaves, columns=['Leaf_Element'])
+                print(df_leaves.head(20)) 
+                if len(leaves) > 20:
+                    print(f"... (還有 {len(leaves)-20} 個沒顯示) ...")
+            else:
+                print("(本身就是最底層)")
+
+except Exception as e:
+    print(f"❌ 錯誤: {e}")
