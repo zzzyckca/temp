@@ -1,55 +1,59 @@
 import os
 import pandas as pd
 
-# 1. Define the folder to search (Change this to your folder path)
+# 1. Define the root folder to search
 folder_path = r'c:\connection' 
 
 # 2. Prepare a list to store results
 results = []
 
-# 3. Loop through all files in the directory
-for filename in os.listdir(folder_path):
-    if filename.endswith(".py"):
-        file_path = os.path.join(folder_path, filename)
-        
-        # Initialize flags for this file
-        has_abc = 'N'
-        has_edf = 'N'
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                
-                for line in lines:
-                    stripped_line = line.strip()
+# 3. Use os.walk() to traverse folder AND subfolders
+for root, dirs, files in os.walk(folder_path):
+    for filename in files:
+        if filename.endswith(".py"):
+            # Construct the full file path
+            full_path = os.path.join(root, filename)
+            
+            # Initialize flags
+            has_abc = 'N'
+            has_edf = 'N'
+            
+            try:
+                # errors='ignore' prevents crashing if a file has weird encoding
+                with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
                     
-                    # Skip commented lines
-                    if stripped_line.startswith("#"):
-                        continue
-                    
-                    # Check for specific import strings
-                    if "from connection_abc import *" in stripped_line:
-                        has_abc = 'Y'
-                    
-                    if "from connection_edf import *" in stripped_line:
-                        has_edf = 'Y'
-        
-        except Exception as e:
-            print(f"Error reading {filename}: {e}")
-            continue
+                    for line in lines:
+                        stripped_line = line.strip()
+                        
+                        # Logic: Skip lines starting with #
+                        if stripped_line.startswith("#"):
+                            continue
+                        
+                        # Logic: Search for the exact import string
+                        if "from connection_abc import *" in stripped_line:
+                            has_abc = 'Y'
+                        
+                        if "from connection_edf import *" in stripped_line:
+                            has_edf = 'Y'
+            
+            except Exception as e:
+                print(f"Error reading {full_path}: {e}")
+                continue
 
-        # Add result to list
-        results.append({
-            'file name': filename,
-            'connection_abc': has_abc,
-            'connection_edf': has_edf
-        })
+            # 4. Store result (Include path to know which subfolder it is in)
+            results.append({
+                'file name': filename,
+                'path': root, # Added path so you know which subfolder
+                'connection_abc': has_abc,
+                'connection_edf': has_edf
+            })
 
-# 4. Create DataFrame and export to Excel
+# 5. Export to Excel
 if results:
     df = pd.DataFrame(results)
-    output_path = 'import_audit_report.xlsx'
+    output_path = 'import_audit_report_recursive.xlsx'
     df.to_excel(output_path, index=False)
-    print(f"Done! Report saved to {output_path}")
+    print(f"Done! Scanned {len(results)} files. Report saved to {output_path}")
 else:
-    print("No .py files found.")
+    print("No .py files found in folder or subfolders.")
