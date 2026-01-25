@@ -1,91 +1,55 @@
+import os
 import pandas as pd
-from TM1py import TM1Service
 
-# --- 1. 連線設定 ---
-TM1_CONFIG = {
-    'address': 'localhost',  # 請改成你的 TM1 Server IP
-    'port': 12345,           # HTTP Port
-    'user': 'admin',
-    'password': 'password',
-    'ssl': True
-}
+# 1. Define the folder to search (Change this to your folder path)
+folder_path = r'c:\connection' 
 
-def main():
-    # --- 2. 硬性設定參數 (Hard Code Area) ---
-    # 請填入你在 TM1 裡真實存在的名稱
-    
-    CUBE_NAME = "General Ledger"  # 你的 Cube 名稱
-    
-    # 這裡定義 Measure (通常放在 Column 軸)
-    # 格式: 'Dimension Name': 'Element Name'
-    MEASURE_SELECTION = {
-        'Measure': 'Amount'  # 例如: 維度叫 Measure, 元素叫 Amount
-    }
+# 2. Prepare a list to store results
+results = []
 
-    # 這裡定義其他的維度 (放在 Row 軸)
-    # 左邊是 TM1 的 Dimension 名稱 (請確保大小寫正確)
-    # 右邊是你要查的 Element 名稱
-    DIM_SELECTIONS = {
-        'Version':        'Budget',
-        'Year':           '2024',
-        'Region':         'Asia',
-        'Department':     'Sales',
-        'Account':        '600100',
-        # 你可以繼續往下加，直到包含所有維度...
-        # 'Project':      'P-001',
-    }
-
-    # --- 3. 自動組裝 MDX (不用動這裡) ---
-    print(f"準備從 Cube [{CUBE_NAME}] 查詢單一數值...")
-
-    # 處理 Rows (將字典轉成 [Dim].[Elem] 格式)
-    # 結果會變成: [Version].[Budget], [Year].[2024], ...
-    row_members = []
-    for dim, elem in DIM_SELECTIONS.items():
-        row_members.append(f"[{dim}].[{elem}]")
-    row_mdx_str = ", ".join(row_members)
-
-    # 處理 Columns (Measure)
-    col_members = []
-    for dim, elem in MEASURE_SELECTION.items():
-        col_members.append(f"[{dim}].[{elem}]")
-    col_mdx_str = ", ".join(col_members)
-
-    # 組合 MDX Query
-    # 注意: 這裡用圓括號 () 包住 row_mdx_str，表示這是一個 Tuple (交集點)
-    mdx_query = f"""
-    SELECT
-        {{ {col_mdx_str} }} ON COLUMNS,
-        {{ ( {row_mdx_str} ) }} ON ROWS
-    FROM [{CUBE_NAME}]
-    """
-
-    print("--- Generated MDX ---")
-    print(mdx_query)
-    print("---------------------")
-
-    # --- 4. 執行查詢 ---
-    try:
-        with TM1Service(**TM1_CONFIG) as tm1:
-            print("連線成功，正在擷取數據...")
-            
-            # 執行 MDX
-            df = tm1.cells.execute_mdx_dataframe(mdx_query)
-            
-            if not df.empty:
-                print("\n成功！查詢結果如下:")
-                print(df)
+# 3. Loop through all files in the directory
+for filename in os.listdir(folder_path):
+    if filename.endswith(".py"):
+        file_path = os.path.join(folder_path, filename)
+        
+        # Initialize flags for this file
+        has_abc = 'N'
+        has_edf = 'N'
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
                 
-                # 取得具體數值 (假設只有一個值)
-                # TM1py dataframe 預設 column 結構可能包含維度名
-                # 我們直接要把數值印出來
-                print("\nValue:", df.iloc[0, 0]) 
-            else:
-                print("\n查詢成功，但回傳為空 (該交集點可能沒有數據或被 Zero Suppressed)。")
+                for line in lines:
+                    stripped_line = line.strip()
+                    
+                    # Skip commented lines
+                    if stripped_line.startswith("#"):
+                        continue
+                    
+                    # Check for specific import strings
+                    if "from connection_abc import *" in stripped_line:
+                        has_abc = 'Y'
+                    
+                    if "from connection_edf import *" in stripped_line:
+                        has_edf = 'Y'
+        
+        except Exception as e:
+            print(f"Error reading {filename}: {e}")
+            continue
 
-    except Exception as e:
-        print(f"\n錯誤發生: {e}")
-        print("提示: 請檢查 Dimension 名稱是否與 TM1 Server 內完全一致。")
+        # Add result to list
+        results.append({
+            'file name': filename,
+            'connection_abc': has_abc,
+            'connection_edf': has_edf
+        })
 
-if __name__ == "__main__":
-    main()
+# 4. Create DataFrame and export to Excel
+if results:
+    df = pd.DataFrame(results)
+    output_path = 'import_audit_report.xlsx'
+    df.to_excel(output_path, index=False)
+    print(f"Done! Report saved to {output_path}")
+else:
+    print("No .py files found.")
