@@ -1,59 +1,67 @@
 import os
 import pandas as pd
+import re
 
-# 1. Define the root folder to search
-folder_path = r'c:\connection' 
+# ================= 設定 =================
+# 1. 這是你要 "搜查" 的資料夾 (放 main script 的地方)
+# 請確認這路徑是否完全正確，如果不對請自行修改
+search_folder = r'c:\python script' 
+# =======================================
 
-# 2. Prepare a list to store results
 results = []
 
-# 3. Use os.walk() to traverse folder AND subfolders
-for root, dirs, files in os.walk(folder_path):
+print(f"正在掃描資料夾: {search_folder} ...")
+
+# 2. 開始遞迴掃描 (包含 subfolders)
+for root, dirs, files in os.walk(search_folder):
     for filename in files:
         if filename.endswith(".py"):
-            # Construct the full file path
             full_path = os.path.join(root, filename)
             
-            # Initialize flags
-            has_abc = 'N'
-            has_edf = 'N'
+            # 用 set 儲存這個檔案用到的所有 connection (避免重複)
+            found_connections = set()
             
             try:
-                # errors='ignore' prevents crashing if a file has weird encoding
                 with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                     lines = f.readlines()
                     
                     for line in lines:
                         stripped_line = line.strip()
                         
-                        # Logic: Skip lines starting with #
+                        # A. 跳過註解行 (# 開頭)
                         if stripped_line.startswith("#"):
                             continue
                         
-                        # Logic: Search for the exact import string
-                        if "from connection_abc import *" in stripped_line:
-                            has_abc = 'Y'
+                        # B. 使用 Regex 捉取 pattern
+                        # 邏輯：搵 "from " 開頭，中間係 "(connection_開頭既字)"，結尾係 " import *"
+                        # \w+ 代表任何文字或數字 (即係捉 connection_abc, connection_tm1 等等)
+                        match = re.search(r"from (connection_\w+) import \*", stripped_line)
                         
-                        if "from connection_edf import *" in stripped_line:
-                            has_edf = 'Y'
+                        if match:
+                            # 捉到了！放入 set
+                            conn_name = match.group(1)
+                            found_connections.add(conn_name)
             
             except Exception as e:
-                print(f"Error reading {full_path}: {e}")
+                print(f"讀取錯誤 {filename}: {e}")
                 continue
 
-            # 4. Store result (Include path to know which subfolder it is in)
-            results.append({
-                'file name': filename,
-                'path': root, # Added path so you know which subfolder
-                'connection_abc': has_abc,
-                'connection_edf': has_edf
-            })
+            # 3. 如果這個檔案有用到 connection，就加入報告
+            if found_connections:
+                results.append({
+                    'Script Name': filename,
+                    'Location': root,
+                    # 將捉到的 connection 變成 "connection_a, connection_b" 格式
+                    'Used Connections': ", ".join(sorted(found_connections)) 
+                })
 
-# 5. Export to Excel
+# 4. 輸出 Excel
 if results:
     df = pd.DataFrame(results)
-    output_path = 'import_audit_report_recursive.xlsx'
-    df.to_excel(output_path, index=False)
-    print(f"Done! Scanned {len(results)} files. Report saved to {output_path}")
+    output_filename = 'connection_usage_report.xlsx'
+    df.to_excel(output_filename, index=False)
+    print(f"-" * 30)
+    print(f"完成！報告已儲存為: {output_filename}")
+    print(f"總共發現 {len(results)} 個 Script 有使用 Connection。")
 else:
-    print("No .py files found in folder or subfolders.")
+    print(f"在 {search_folder} 找不到任何檔案有 import connection。")
