@@ -1,125 +1,20 @@
-import win32com.client
-import pythoncom
-import os
-import shutil
-import pandas as pd
-from prefect import flow, task
-from datetime import datetime
+import base64
+import hashlib
+from cryptography.fernet import Fernet
 
-# --- 設定 ---
-CONFIG_FILE_PATH = r"C:\Work\config.xlsx" # 你的 Excel Config 位置
-TEMP_FOLDER = r"C:\Work\Temp"             # 暫存附件位置
-DEFAULT_FOLDER = r"C:\Work\Unsorted"      # 如果 Excel 無對應規則，去呢度
-TARGET_SUBJECT = "TRIGGER_ME"             # 監聽郵件標題
+# ================= INPUT =================
+data = "123"       # Content to be encrypted
+passcode = "456"   # Your custom passcode/string
+# =========================================
 
-# 確保 Folder 存在
-for f in [TEMP_FOLDER, DEFAULT_FOLDER]:
-    os.makedirs(f, exist_ok=True)
+# 1. Convert "456" into a valid 32-byte Fernet key
+# (Logic: Hash it with SHA256 to get 32 bytes, then Base64 encode it)
+key = base64.urlsafe_b64encode(hashlib.sha256(passcode.encode()).digest())
 
-@task(name="Load Config")
-def load_config_rules():
-    """
-    讀取 Excel Config File，回傳一個 DataFrame
-    """
-    try:
-        df = pd.read_excel(CONFIG_FILE_PATH)
-        # 轉做 Dictionary 方便之後 lookup，例如: [{'Keyword': 'Invoice', 'Folder': 'C:\\...'}]
-        rules = df.to_dict('records') 
-        print(f"📋 Loaded {len(rules)} rules from Excel.")
-        return rules
-    except Exception as e:
-        print(f"❌ Error reading config excel: {e}")
-        return []
+# 2. Encrypt directly (using Fernet(key) inline without assigning 'f')
+token = Fernet(key).encrypt(data.encode())
+print(f"Encrypted Token: {token.decode()}")
 
-@task(name="Process Attachments")
-def save_and_route_attachments(message_item, rules):
-    """
-    下載附件 -> 對照 Rules -> 搬去目的地
-    """
-    # 呢個 task 可能會喺另一個 thread 跑，如果你用 .serve
-    # 但因為我地係 pass `message_item` object (COM Object) 入黎，
-    # 跨 thread 用 COM object 係極危險。
-    # **改良策略**：最好係喺 Main Logic 做完 win32com 操作，只 pass filePath string 俾 Task。
-    # 不過為左簡單示範，我地假設這是單線程，或者在 flow 內直接操作。
-    
-    # 檢查有無附件
-    if message_item.Attachments.Count == 0:
-        print("No attachments found.")
-        return
-
-    for i in range(1, message_item.Attachments.Count + 1):
-        attachment = message_item.Attachments.Item(i)
-        filename = attachment.FileName
-        print(f"📎 Processing file: {filename}")
-
-        # 1. 先 Save 去 Temp Folder
-        temp_path = os.path.join(TEMP_FOLDER, filename)
-        # win32com 需要完整絕對路徑 (Absolute Path)
-        attachment.SaveAsFile(temp_path)
-
-        # 2. Check Excel Rules (簡單邏輯：檔名包含 Keyword)
-        destination = DEFAULT_FOLDER
-        matched_rule = False
-
-        for rule in rules:
-            keyword = str(rule.get('Keyword', '')).lower()
-            target_dir = rule.get('Destination_Folder')
-            
-            # 邏輯核心：如果 Keyword 喺 檔名 入面
-            if keyword in filename.lower():
-                destination = target_dir
-                matched_rule = True
-                print(f"✅ Matched Rule: '{keyword}' -> {destination}")
-                break # 搵到就停
-        
-        # 3. 搬運檔案 (Move)
-        try:
-            # 確保目標 Folder 存在
-            os.makedirs(destination, exist_ok=True)
-            
-            final_path = os.path.join(destination, filename)
-            
-            # 如果目標已有同名檔，這裡會 Error，你可以加 timestamp 解決，這裡從簡
-            shutil.move(temp_path, final_path)
-            print(f"🚚 Moved to: {final_path}")
-            
-        except Exception as e:
-            print(f"❌ Error moving file: {e}")
-
-
-@flow(name="Excel_Router_Flow", log_prints=True)
-def email_router_flow():
-    pythoncom.CoInitialize() # 必加
-    
-    try:
-        # 1. 連接 Outlook
-        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-        inbox = outlook.GetDefaultFolder(6)
-        
-        # 2. 讀取 Excel Config
-        rules = load_config_rules()
-        
-        # 3. 搵信
-        messages = inbox.Items.Restrict(f"[UnRead] = True AND [Subject] = '{TARGET_SUBJECT}'")
-        
-        # 4. 處理每一封信
-        # 注意：win32com collection 最好轉做 list 先 loop，避免 index shift
-        for msg in list(messages):
-            print(f"📧 New Email: {msg.Subject}")
-            
-            # 處理該信件的所有附件
-            save_and_route_attachments(msg, rules)
-            
-            # 5. Mark 已讀 & 移走 (Cleanup)
-            msg.UnRead = False
-            # msg.Move(inbox.Folders("Processed")) # Optional: 建議移走
-            
-    except Exception as e:
-        print(f"Flow Error: {e}")
-    finally:
-        pythoncom.CoUninitialize()
-
-if __name__ == "__main__":
-    # 每 1 分鐘 Check 一次
-    print("🚀 Starting Outlook File Router...")
-    email_router_flow.serve(name="file-router-v1", interval=60)
+# 3. Decrypt directly
+original = Fernet(key).decrypt(token).decode()
+print(f"Decrypted Original: {original}")
