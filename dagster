@@ -1,0 +1,24 @@
+from dagster import asset, define_asset_job, ScheduleDefinition, Definitions
+
+# 1. 定義一個 Asset (你想執行的任務)
+@asset
+def simple_task():
+    print("Task is running on Windows!")
+    return "Done"
+
+# 2. 定義一個 Job (將 Asset 變為可執行的工作)
+my_job = define_asset_job(name="my_simple_job", selection="*")
+
+# 3. 定義 Schedule (設定時間表，這裡是每分鐘一次，格式是 Cron)
+# Windows 支援基本的 Cron 格式
+my_schedule = ScheduleDefinition(
+    name="every_minute_schedule",
+    job=my_job,
+    cron_schedule="* * * * *",  # 每分鐘執行一次
+)
+
+# 4. 將所有東西包裝在 Definitions 裡
+defs = Definitions(
+    assets=[simple_task],
+    schedules=[my_schedule],
+)
