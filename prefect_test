@@ -1,0 +1,23 @@
+from prefect import flow, task
+import time
+
+# 1. 定義 Task (具體要做嘅野)
+@task
+def say_hello():
+    print("👋 Hello from Windows!")
+    return "Done"
+
+# 2. 定義 Flow (將 Tasks 串聯起來)
+@flow(log_prints=True)  # log_prints=True 確保你嘅 print 會顯示在 UI
+def my_flow():
+    print("🚀 Starting flow...")
+    say_hello()
+
+# 3. 設定 Schedule (這是 Prefect 最屈機方便的地方: .serve)
+if __name__ == "__main__":
+    # 這行指令會令這個 Script 變成一個長駐 process，自動每分鐘跑一次
+    my_flow.serve(
+        name="my-windows-deployment",
+        cron="* * * * *"  # 每分鐘一次
+    )
+
