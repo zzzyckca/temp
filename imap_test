@@ -1,0 +1,46 @@
+import imaplib
+import socket
+
+def test_imap_connection(server, port, username, password):
+    try:
+        print(f"Attempting to connect to {server}:{port}...")
+        
+        # 1. Establish SSL connection (IMAP usually uses SSL on Port 993)
+        # If your server does not use SSL (rare), use imaplib.IMAP4(server, port) instead
+        mail = imaplib.IMAP4_SSL(host=server, port=port)
+        
+        print("Connection successful, attempting to login...")
+
+        # 2. Attempt to login
+        mail.login(username, password)
+        
+        print("✅ Login Successful!")
+        print(f"Server Response: {mail.welcome}")
+
+        # 3. Logout and close connection
+        mail.logout()
+        return True
+
+    except imaplib.IMAP4.error as e:
+        print(f"❌ Login Failed (Authentication Failed): {e}")
+        return False
+    except socket.gaierror:
+        print("❌ Server not found (DNS Error) - Check Server Address")
+        return False
+    except socket.timeout:
+        print("❌ Connection Timeout - Server did not respond")
+        return False
+    except Exception as e:
+        print(f"❌ Unexpected Error: {e}")
+        return False
+
+# --- Configuration ---
+# e.g., Gmail is 'imap.gmail.com', Outlook is 'outlook.office365.com'
+IMAP_SERVER = 'imap.example.com' 
+IMAP_PORT = 993 # SSL is usually 993
+EMAIL_USER = 'your_email@example.com'
+EMAIL_PASS = 'your_password'
+
+# --- Execute Test ---
+if __name__ == "__main__":
+    test_imap_connection(IMAP_SERVER, IMAP_PORT, EMAIL_USER, EMAIL_PASS)
