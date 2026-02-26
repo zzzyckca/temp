@@ -1,0 +1,188 @@
+# config.ini
+PREFECT_DIR=C:\prefect
+VENV_DIR=C:\prefect\venv
+PREFECT_HOME=C:\prefect\.prefect
+WORK_POOL_NAME=local-windows-pool
+PYTHON_PATH=C:\Program Files\Python312\python.exe
+PIP_CONFIG_PATH=C:\prefect\pip.ini
+
+# requirements.txt
+prefect==3.6.19
+pandas==3.0.1
+selenium==4.41.0
+chromedriver-py==145.0.7632.117
+
+# install.bat
+@echo off
+cd /d "%~dp0"
+echo [Install] Reading config.ini settings...
+
+:: Parse variables from config.ini
+for /f "tokens=1,2 delims==" %%a in (config.ini) do (
+    set %%a=%%b
+)
+
+echo Project Directory: %PREFECT_DIR%
+echo Virtual Env: %VENV_DIR%
+echo Prefect Home: %PREFECT_HOME%
+echo Python Path: %PYTHON_PATH%
+echo Pip Config Path: %PIP_CONFIG_PATH%
+
+:: Create required directories if they do not exist
+if not exist "%PREFECT_DIR%" mkdir "%PREFECT_DIR%"
+if not exist "%PREFECT_HOME%" mkdir "%PREFECT_HOME%"
+
+echo.
+echo [Install] Creating Python virtual environment using specified Python...
+"%PYTHON_PATH%" -m venv "%VENV_DIR%"
+
+:: Copy the custom pip config into the virtual environment before installing packages
+if exist "%PIP_CONFIG_PATH%" (
+    echo [Install] Copying custom pip configuration to virtual environment...
+    copy /Y "%PIP_CONFIG_PATH%" "%VENV_DIR%\pip.ini" >nul
+) else (
+    echo [Warning] Custom pip config not found at %PIP_CONFIG_PATH%. Skipping copy.
+)
+
+echo [Install] Activating virtual environment and upgrading pip...
+call "%VENV_DIR%\Scripts\activate.bat"
+python -m pip install --upgrade pip
+
+:: Check for requirements.txt and install dependencies
+if exist "requirements.txt" (
+    echo [Install] Found requirements.txt. Installing dependencies...
+    pip install -r requirements.txt
+) else (
+    echo [Warning] requirements.txt not found! Installing prefect only...
+    pip install prefect
+)
+
+echo.
+echo [Install] Setup completed successfully! You can now run start.bat.
+pause
+
+# start
+@echo off
+:: Change directory to the location of this batch file
+cd /d "%~dp0"
+
+echo [Start] Reading config.ini settings...
+
+:: Parse variables from config.ini
+for /f "tokens=1,2 delims==" %%a in (config.ini) do (
+    set %%a=%%b
+)
+
+echo [Start] Starting Prefect Server in the background (Hidden)...
+:: Start Prefect Server using a hidden PowerShell window
+powershell -Command "Start-Process cmd -ArgumentList '/c call \"%VENV_DIR%\Scripts\activate.bat\" && set PREFECT_HOME=%PREFECT_HOME% && prefect server start' -WindowStyle Hidden"
+
+:: Wait 5 seconds to ensure the server initializes properly
+timeout /t 5 /nobreak >nul
+
+echo [Start] Starting Prefect Worker in the background (Hidden)...
+:: Start Prefect Worker using a hidden PowerShell window
+powershell -Command "Start-Process cmd -ArgumentList '/c call \"%VENV_DIR%\Scripts\activate.bat\" && set PREFECT_HOME=%PREFECT_HOME% && prefect worker start --pool %WORK_POOL_NAME%' -WindowStyle Hidden"
+
+echo.
+echo [Success] Server and Worker are now running completely hidden in the background!
+echo You can safely close this window.
+echo UI URL: http://127.0.0.1:4200
+pause
+
+# end 
+@echo off
+echo [Stop] Terminating all Prefect processes...
+
+:: Forcefully terminate all prefect.exe processes and their child processes
+taskkill /F /IM prefect.exe /T >nul 2>&1
+
+echo [Stop] All Prefect background services have been completely stopped.
+pause
+
+# master
+import os
+import subprocess
+from prefect import task, flow
+
+@task
+def run_external_script(script_path):
+    """
+    Execute an external Python script using subprocess.
+    """
+    print(f"Starting execution: {script_path}")
+    
+    # Verify if the file exists before running
+    if not os.path.exists(script_path):
+        raise FileNotFoundError(f"Script not found at path: {script_path}")
+        
+    result = subprocess.run(
+        ["python", script_path], 
+        capture_output=True, 
+        text=True
+    )
+    
+    # Print standard output if any
+    if result.stdout:
+        print(f"Output:\n{result.stdout.strip()}")
+        
+    # Raise an error if the script failed (return code is not 0)
+    if result.returncode != 0:
+        print(f"Error Output:\n{result.stderr.strip()}")
+        raise RuntimeError(f"Script failed to execute: {script_path}")
+        
+    print(f"Successfully completed: {script_path}\n")
+
+
+@flow(name="Daily-Temp1-Pipeline", log_prints=True)
+def daily_temp1_jobs():
+    """
+    Main flow to execute task1.py to task4.py sequentially.
+    """
+    # Define the base directory where your tasks are located
+    base_dir = r"C:\prefect\temp1"
+    
+    # Execute tasks sequentially
+    run_external_script(os.path.join(base_dir, "task1.py"))
+    run_external_script(os.path.join(base_dir, "task2.py"))
+    run_external_script(os.path.join(base_dir, "task3.py"))
+    run_external_script(os.path.join(base_dir, "task4.py"))
+
+
+if __name__ == "__main__":
+    # Deploy the flow to Prefect Server
+    # cron="0 9 * * *" means running at 09:00 AM every day
+    daily_temp1_jobs.deploy(
+        name="daily-9am-temp1-tasks",
+        work_pool_name="local-windows-pool",
+        cron="0 9 * * *",
+        timezone="America/Toronto"
+    )
+
+## Deployment
+@echo off
+:: Change directory to the location of this batch file
+cd /d "%~dp0"
+
+echo [Deploy] Reading config.ini settings...
+
+:: Parse variables from config.ini
+for /f "tokens=1,2 delims==" %%a in (config.ini) do (
+    set %%a=%%b
+)
+
+echo [Deploy] Activating virtual environment...
+call "%VENV_DIR%\Scripts\activate.bat"
+
+echo [Deploy] Setting PREFECT_HOME to isolate the database...
+set PREFECT_HOME=%PREFECT_HOME%
+
+echo [Deploy] Running master_pipeline.py to register deployments to the Server...
+echo ----------------------------------------------------------------------
+python master_pipeline.py
+echo ----------------------------------------------------------------------
+
+echo.
+echo [Deploy] Deployment process finished! 
+echo Check your Deployments in the UI: http://127.0.0.1:4200
+pause
