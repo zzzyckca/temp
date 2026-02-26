@@ -1,20 +1,36 @@
-Act as an expert Data Engineer. Please generate a complete, production-ready, local Prefect orchestration setup for Windows. 
+@echo off
+cd /d "%~dp0"
 
-Strict Rules for the Output:
-1. ABSOLUTELY NO EMOJIS in the code, comments, or console outputs.
-2. All code comments, echo messages, and variable names MUST be in English.
-3. Use `cd /d "%~dp0"` in all batch files to ensure relative path execution.
-4. The database and configuration MUST be isolated using a custom `PREFECT_HOME` environment variable to prevent conflicts with other projects.
-5. Background processes must be completely hidden (no lingering CMD windows).
+echo [1/3] Reading config.ini...
+for /f "usebackq eol=; tokens=1,* delims==" %%a in ("config.ini") do (
+    if not "%%b"=="" set "%%a=%%b"
+)
 
-Please generate the following 7 files:
+echo [2/3] Checking Directory: %PREFECT_HOME%
+:: 如果資料夾唔存在，就整返個，仲要寫入一個測試檔睇吓有無 Permission
+if not exist "%PREFECT_HOME%" mkdir "%PREFECT_HOME%"
+echo test > "%PREFECT_HOME%\perm_test.txt"
+if exist "%PREFECT_HOME%\perm_test.txt" (
+    del "%PREFECT_HOME%\perm_test.txt"
+    echo [OK] Permission verified.
+) else (
+    echo [ERROR] No write permission to %PREFECT_HOME%!
+    pause
+    exit
+)
 
-1. `config.ini`: A configuration file defining PREFECT_DIR, VENV_DIR, PREFECT_HOME, and WORK_POOL_NAME (e.g., local-windows-pool).
-2. `requirements.txt`: Include 'prefect', 'pandas', and 'selenium'.
-3. `install.bat`: Reads config.ini, creates directories, initializes a Python venv, upgrades pip, and installs packages from requirements.txt.
-4. `start.bat`: Reads config.ini, sets PREFECT_HOME, and uses PowerShell with '-WindowStyle Hidden' to start the `prefect server start` process. Waits 5 seconds, then starts the `prefect worker start --pool [WORK_POOL_NAME]` process in another hidden PowerShell window.
-5. `stop.bat`: Uses `taskkill /F /IM prefect.exe /T` to silently terminate all Prefect background processes.
-6. `master_pipeline.py`: A Python script using Prefect `@task` and `@flow`. It should use `subprocess.run` to sequentially execute 4 dummy external scripts (task1.py to task4.py) located in a subfolder. It must include a `deploy()` block to register the flow with a daily 9 AM cron schedule and specify the work pool name.
-7. `deployment.bat`: Reads config.ini, activates the venv, sets PREFECT_HOME, and runs `python master_pipeline.py` to register the deployment to the server.
+echo [3/3] Starting Services (Minimizing to Taskbar)...
 
-Provide the exact code for each file clearly separated.
+:: 先開 Server
+start "Prefect_Server" /min cmd /c "call "%VENV_DIR%\Scripts\activate.bat" && set PREFECT_HOME=%PREFECT_HOME% && prefect server start"
+
+timeout /t 8 /nobreak >nul
+
+:: 再開 Worker
+start "Prefect_Worker" /min cmd /c "call "%VENV_DIR%\Scripts\activate.bat" && set PREFECT_HOME=%PREFECT_HOME% && prefect worker start --pool %WORK_POOL_NAME%"
+
+echo.
+echo [Finish] Services launched. 
+echo If the windows in taskbar remain open, it's working!
+echo UI URL: http://127.0.0.1:4200
+pause
