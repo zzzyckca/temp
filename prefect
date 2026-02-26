@@ -106,7 +106,7 @@ import subprocess
 from prefect import task, flow
 
 @task
-def run_external_script(script_path):
+def run_task(script_path):
     """
     Execute an external Python script using subprocess.
     """
@@ -134,26 +134,23 @@ def run_external_script(script_path):
     print(f"Successfully completed: {script_path}\n")
 
 
-@flow(name="Daily-Temp1-Pipeline", log_prints=True)
-def daily_temp1_jobs():
+@flow(name="Daily-Temp-Pipeline", log_prints=True)
+def daily_temp_jobs():
     """
-    Main flow to execute task1.py to task4.py sequentially.
+    Main flow to execute tasks sequentially using absolute paths.
     """
-    # Define the base directory where your tasks are located
-    base_dir = r"C:\prefect\temp1"
-    
-    # Execute tasks sequentially
-    run_external_script(os.path.join(base_dir, "task1.py"))
-    run_external_script(os.path.join(base_dir, "task2.py"))
-    run_external_script(os.path.join(base_dir, "task3.py"))
-    run_external_script(os.path.join(base_dir, "task4.py"))
+    # Execute tasks sequentially by providing the full path directly
+    # Always use r"..." (raw string) for Windows paths to prevent backslash issues
+    run_task(r"c:\temp\temp1.py")
+    run_task(r"c:\temp\temp2.py")
+    run_task(r"c:\temp\temp3.py")
+    run_task(r"c:\temp\temp4.py")
 
 
 if __name__ == "__main__":
     # Deploy the flow to Prefect Server
-    # cron="0 9 * * *" means running at 09:00 AM every day
-    daily_temp1_jobs.deploy(
-        name="daily-9am-temp1-tasks",
+    daily_temp_jobs.deploy(
+        name="daily-9am-temp-tasks",
         work_pool_name="local-windows-pool",
         cron="0 9 * * *",
         timezone="America/Toronto"
