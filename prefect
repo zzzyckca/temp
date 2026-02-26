@@ -75,14 +75,14 @@ for /f "tokens=1,2 delims==" %%a in (config.ini) do (
 
 echo [Start] Starting Prefect Server in the background (Hidden)...
 :: Start Prefect Server using a hidden PowerShell window
-powershell -Command "Start-Process cmd -ArgumentList '/c call \"%VENV_DIR%\Scripts\activate.bat\" && set PREFECT_HOME=%PREFECT_HOME% && prefect server start' -WindowStyle Hidden"
+start "Prefect_Server" /min cmd /c "call "%VENV_DIR%\Scripts\activate.bat" && set "PREFECT_HOME=%PREFECT_HOME%" && prefect server start"
 
 :: Wait 5 seconds to ensure the server initializes properly
 timeout /t 5 /nobreak >nul
 
 echo [Start] Starting Prefect Worker in the background (Hidden)...
 :: Start Prefect Worker using a hidden PowerShell window
-powershell -Command "Start-Process cmd -ArgumentList '/c call \"%VENV_DIR%\Scripts\activate.bat\" && set PREFECT_HOME=%PREFECT_HOME% && prefect worker start --pool %WORK_POOL_NAME%' -WindowStyle Hidden"
+start "Prefect_Worker" /min cmd /c "call "%VENV_DIR%\Scripts\activate.bat" && set "PREFECT_HOME=%PREFECT_HOME%" && prefect worker start --pool %WORK_POOL_NAME%"
 
 echo.
 echo [Success] Server and Worker are now running completely hidden in the background!
