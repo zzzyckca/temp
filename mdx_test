@@ -1,0 +1,315 @@
+"""
+dump_mdx_phase3.py
+------------------
+Dump all 4 CNB report types to ONE Excel workbook, one sheet per report.
+
+Each sheet shows:
+  * meta (report type / family / template / period / OU count)
+  * the PARAMETERS that go into the report MDX, per axis (ON 0 / ON 1 / WHERE),
+    including the operating_unit dimension
+  * the FINAL MDX (one query line per row; {operating_unit} left as a placeholder)
+  * the OU CODES -- each is substituted into {operating_unit}, producing ONE MDX
+    per OU at run time; codes come from ou_list[report_column]
+
+Reads each template's EPM_info sheet + ou_list.xlsx via Excel only. NO TM1,
+no xlwings, no rendering. The MDX-building mirrors config_mdx() in
+cnb_common_phase3.py, so the MDX dumped here equals what the live pipeline sends.
+
+Run:  python dump_mdx_phase3.py
+Then open the workbook named in OUTPUT_XLSX below.
+"""
+
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
+# ============================ config (edit paths) ============================
+TEMPLATE_DIR = r""
+OU_LIST_PATH = r""
+OU_SHEET     = "ou"
+OUTPUT_XLSX  = r"C:\temp1\mdx_dump_phase3.xlsx"
+
+# (report_column / sheet name, template file)
+REPORTS = [
+    ("MMR(LOB)",  "MMR(LOB)-template.xlsx"),
+    ("MMFR(LOB)", "MMFR(LOB)-template.xlsx"),
+    ("MMFRS",     "MMFRS-template.xlsx"),
+    ("MMRS",      "MMRS-template.xlsx"),
+]
+MMFR_REPORTS = ("MMFR(LOB)", "MMFRS", "MMRS")
+# ============================================================================
+
+
+def build(report_type, info_df):
+    """Mirror config_mdx: return (family, reporting_period, params, mdx).
+    params is a list of (axis, dimension, [values], source-note) for printing."""
+
+    reporting_period = info_df["Current Reporting Year"].iloc[0] + info_df["Current Reporting Month"].iloc[0]
+    current_month = info_df["Current Reporting Month"].iloc[0]
+
+    def vals(col):
+        out = []
+        for v in info_df[col].dropna():
+            out.append(v)
+        return out
+
+    params = []
+
+    # ---- shared dimension strings ----
+    time_period_parts = []
+    for x in vals("cnb_time_period"):
+        time_period_parts.append(f""" DISTINCT(
+        {{
+            DESCENDANTS(
+            [cnb_time_period].[cnb_time_period].[{x}.FY] , 99 , LEAVES),
+            [cnb_time_period].[cnb_time_period].[{x}.FY],
+            [cnb_time_period].[cnb_time_period].[{x}.{current_month}.FYTD]
+        }})""")
+    time_period_string = ",".join(time_period_parts)
+
+    acct_parts = []
+    for value in vals("cnb_account"):
+        acct_parts.append(f"[cnb_account].[cnb_account].[{value.split(' ')[0]}]")
+    acct_string = ",".join(acct_parts)
+
+    counter_party_parts = []
+    for value in vals("cnb_counter_party_operating_unit"):
+        counter_party_parts.append(f"[cnb_counter_party_operating_unit].[cnb_counter_party_operating_unit].[{value}]")
+    counter_party_string = ",".join(counter_party_parts)
+
+    cnb_gaap_parts = []
+    for value in vals("cnb_gaap"):
+        cnb_gaap_parts.append(f"[cnb_gaap].[cnb_gaap].[{value}]")
+    cnb_gaap_string = ",".join(cnb_gaap_parts)
+
+    cnb_currency_parts = []
+    for value in vals("cnb_currency"):
+        cnb_currency_parts.append(f"[cnb_currency].[cnb_currency].[{value}]")
+    cnb_currency_string = ",".join(cnb_currency_parts)
+
+    cnb_project_parts = []
+    for value in vals("cnb_project"):
+        cnb_project_parts.append(f"[cnb_project].[cnb_project].[{value}]")
+    cnb_project_string = ",".join(cnb_project_parts)
+
+    cnb_product_parts = []
+    for value in vals("cnb_product"):
+        cnb_product_parts.append(f"[cnb_product].[cnb_product].[{value}]")
+    cnb_product_string = ",".join(cnb_product_parts)
+
+    cnb_source_parts = []
+    for value in vals("cnb_source"):
+        cnb_source_parts.append(f"[cnb_source].[cnb_source].[{value}]")
+    cnb_source_string = ",".join(cnb_source_parts)
+
+    if report_type == "MMR(LOB)":
+        family = "MMR-type"
+        acct_spot_parts = []
+        for value in vals("cnb_account_spot"):
+            acct_spot_parts.append(f"[cnb_account].[cnb_account].[{value.split(' ')[0]}]")
+        acct_string_spot = ",".join(acct_spot_parts)
+
+        params.append(("ON 0",  "cnb_time_period",    vals("cnb_time_period"),    "EPM_info col cnb_time_period"))
+        params.append(("ON 1",  "cnb_account_spot",   vals("cnb_account_spot"),   "EPM_info col cnb_account_spot  (Spot tuple; code = first token)"))
+        params.append(("ON 1",  "cnb_account",        vals("cnb_account"),        "EPM_info col cnb_account       (MX_2 tuple; code = first token)"))
+        params.append(("ON 1",  "cnb_scenario",       ["Adjusted Actual", "Restated Plan"], "HARD-CODED in the MDX -- NOT from EPM_info"))
+        params.append(("ON 1",  "reporting_measure",  ["Spot", "MX_2"],           "HARD-CODED in the MDX -- NOT from EPM_info"))
+        params.append(("ON 1",  "cnb_operating_unit", ["{operating_unit}"],       "filled per OU from ou_list[report_column] -- see OU CODES section"))
+        params.append(("WHERE", "cnb_counter_party_operating_unit", vals("cnb_counter_party_operating_unit"), "EPM_info col cnb_counter_party_operating_unit"))
+        params.append(("WHERE", "cnb_gaap",           vals("cnb_gaap"),           "EPM_info col cnb_gaap"))
+        params.append(("WHERE", "cnb_currency",       vals("cnb_currency"),       "EPM_info col cnb_currency"))
+        params.append(("WHERE", "cnb_project",        vals("cnb_project"),        "EPM_info col cnb_project"))
+        params.append(("WHERE", "cnb_product",        vals("cnb_product"),        "EPM_info col cnb_product"))
+        params.append(("WHERE", "cnb_source",         vals("cnb_source"),         "EPM_info col cnb_source"))
+
+        mdx = f"""SELECT
+        {{
+            {time_period_string}
+        }} ON 0, NON EMPTY
+        {{(
+        {{
+            [cnb_scenario].[cnb_scenario].[Adjusted Actual]
+        }}*{{
+            [reporting_measure].[reporting_measure].[Spot]
+        }}*{{
+            [cnb_operating_unit].[cnb_operating_unit].[{{operating_unit}}]
+        }}*{{
+            {acct_string_spot}
+        }}
+        ),
+        (
+        {{
+            [cnb_scenario].[cnb_scenario].[Adjusted Actual],
+            [cnb_scenario].[cnb_scenario].[Restated Plan]
+        }}*{{
+            [reporting_measure].[reporting_measure].[MX_2]
+        }}*{{
+            [cnb_operating_unit].[cnb_operating_unit].[{{operating_unit}}]
+        }}*{{
+            {acct_string}
+        }}
+        )}} ON 1
+        FROM
+        [cnb_reporting]
+        WHERE (
+        {counter_party_string},
+            {cnb_gaap_string},
+            {cnb_currency_string},
+            {cnb_project_string},
+            {cnb_product_string},
+            {cnb_source_string})"""
+
+    elif report_type in MMFR_REPORTS:
+        family = "MMFR-type"
+        prior_year = int(info_df["cnb_time_period"].iloc[0]) - 1
+
+        scenario_parts = []
+        for value in vals("cnb_scenario"):
+            scenario_parts.append(f"[cnb_scenario].[cnb_scenario].[{value}]")
+        scenario_string = ",".join(scenario_parts)
+
+        reporting_measure_parts = []
+        for value in vals("reporting_measure"):
+            reporting_measure_parts.append(f"[reporting_measure].[reporting_measure].[{value}]")
+        reporting_measure_string = ",".join(reporting_measure_parts)
+
+        params.append(("ON 0",  "prior_year",         [f"{prior_year}.FY"],       f"DERIVED = int(cnb_time_period[0]) - 1 = {prior_year}"))
+        params.append(("ON 0",  "cnb_time_period",    vals("cnb_time_period"),    "EPM_info col cnb_time_period"))
+        params.append(("ON 1",  "cnb_scenario",       vals("cnb_scenario"),       "EPM_info col cnb_scenario"))
+        params.append(("ON 1",  "cnb_account",        vals("cnb_account"),        "EPM_info col cnb_account  (code = first token)"))
+        params.append(("ON 1",  "cnb_operating_unit", ["{operating_unit}"],       "filled per OU from ou_list[report_column] -- see OU CODES section"))
+        params.append(("WHERE", "cnb_counter_party_operating_unit", vals("cnb_counter_party_operating_unit"), "EPM_info col cnb_counter_party_operating_unit"))
+        params.append(("WHERE", "cnb_gaap",           vals("cnb_gaap"),           "EPM_info col cnb_gaap"))
+        params.append(("WHERE", "cnb_currency",       vals("cnb_currency"),       "EPM_info col cnb_currency"))
+        params.append(("WHERE", "cnb_project",        vals("cnb_project"),        "EPM_info col cnb_project"))
+        params.append(("WHERE", "cnb_product",        vals("cnb_product"),        "EPM_info col cnb_product"))
+        params.append(("WHERE", "reporting_measure",  vals("reporting_measure"),  "EPM_info col reporting_measure  (slicer)"))
+        params.append(("WHERE", "cnb_source",         vals("cnb_source"),         "EPM_info col cnb_source"))
+
+        mdx = f"""SELECT
+        {{
+            [cnb_time_period].[cnb_time_period].[{prior_year}.FY],
+            {time_period_string}
+        }} ON 0, NON EMPTY
+        {{
+            {scenario_string}
+        }}*{{
+            [cnb_operating_unit].[cnb_operating_unit].[{{operating_unit}}]
+        }}*{{
+            {acct_string}
+        }} ON 1
+        FROM
+        [cnb_reporting]
+        WHERE (
+        {counter_party_string},
+            {cnb_gaap_string},
+            {cnb_currency_string},
+            {cnb_project_string},
+            {cnb_product_string},
+            {reporting_measure_string},
+            {cnb_source_string})"""
+
+    else:
+        raise ValueError(f"unknown report: {report_type}")
+
+    return family, reporting_period, params, mdx
+
+
+# ---- styles ----
+F_TITLE  = Font(name="Arial", bold=True, color="FFFFFF", size=13)
+F_BOLD   = Font(name="Arial", bold=True)
+F_NORM   = Font(name="Arial")
+F_MONO   = Font(name="Consolas")
+FILL_TITLE = PatternFill("solid", fgColor="1F4E78")
+FILL_HDR   = PatternFill("solid", fgColor="DDEBF7")
+FILL_SECT  = PatternFill("solid", fgColor="F2F2F2")
+WRAP = Alignment(wrap_text=True, vertical="top")
+TOP  = Alignment(vertical="top")
+
+
+def write_sheet(ws, report_type, family, period, template_file, params, mdx, ou_codes):
+    year_month = period
+
+    # title
+    ws.merge_cells("A1:D1")
+    ws["A1"] = f"CNB report MDX   --   {report_type}    [{family}]"
+    ws["A1"].font = F_TITLE
+    ws["A1"].fill = FILL_TITLE
+    ws.row_dimensions[1].height = 22
+
+    r = 2
+    for k, v in [("Template", template_file), ("Period", year_month), ("OU count", str(len(ou_codes)))]:
+        ws.cell(r, 1, k).font = F_BOLD
+        ws.cell(r, 2, v).font = F_NORM
+        r += 1
+    r += 1
+
+    # parameters
+    cell = ws.cell(r, 1, "PARAMETERS that go into the report MDX")
+    cell.font = F_BOLD
+    cell.fill = FILL_SECT
+    r += 1
+    for ci, h in enumerate(["Axis", "Dimension", "Values", "Source"], start=1):
+        c = ws.cell(r, ci, h)
+        c.font = F_BOLD
+        c.fill = FILL_HDR
+    r += 1
+    for axis, dim, values, src in params:
+        ws.cell(r, 1, axis).font = F_NORM
+        ws.cell(r, 2, dim).font = F_NORM
+        vc = ws.cell(r, 3, ", ".join(values) if values else "(none)")
+        vc.font = F_NORM
+        vc.alignment = WRAP
+        sc = ws.cell(r, 4, src)
+        sc.font = F_NORM
+        sc.alignment = WRAP
+        r += 1
+    r += 1
+
+    # final mdx (one query line per row; columns B+ stay empty so the line shows in full)
+    cell = ws.cell(r, 1, "FINAL MDX   ({operating_unit} replaced with each OU code at run time)")
+    cell.font = F_BOLD
+    cell.fill = FILL_SECT
+    r += 1
+    for ln in mdx.split("\n"):
+        c = ws.cell(r, 1, ln)
+        c.font = F_MONO
+        c.alignment = TOP
+        r += 1
+    r += 1
+
+    # ou codes (each one is substituted into {operating_unit} -> one MDX per OU)
+    cell = ws.cell(r, 1, f"OU CODES  ({len(ou_codes)})  --  each substituted into {{operating_unit}}, one MDX per OU   (from ou_list[{report_type}])")
+    cell.font = F_BOLD
+    cell.fill = FILL_SECT
+    r += 1
+    start = r
+    for i, code in enumerate(ou_codes):
+        rr = start + i // 8
+        cc = 1 + i % 8
+        ws.cell(rr, cc, code).font = F_MONO
+
+    ws.column_dimensions["A"].width = 18
+    ws.column_dimensions["B"].width = 26
+    ws.column_dimensions["C"].width = 52
+    ws.column_dimensions["D"].width = 50
+    ws.freeze_panes = "A2"
+
+
+def main():
+    wb = Workbook()
+    wb.remove(wb.active)
+    for report_type, template_file in REPORTS:
+        info_df = pd.read_excel(TEMPLATE_DIR + "\\" + template_file, sheet_name="EPM_info", dtype=str)
+        ou_raw = pd.read_excel(OU_LIST_PATH, sheet_name=OU_SHEET)
+        ou_codes = ou_raw[report_type].str.split(" ").str[0].dropna().tolist()
+        family, period, params, mdx = build(report_type, info_df)
+        ws = wb.create_sheet(title=report_type)
+        write_sheet(ws, report_type, family, period, template_file, params, mdx, ou_codes)
+        print(f"{report_type:10s} [{family}]  period {period}  OUs {len(ou_codes)}")
+    wb.save(OUTPUT_XLSX)
+    print("wrote", OUTPUT_XLSX)
+
+
+if __name__ == "__main__":
+    main()
