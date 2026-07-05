@@ -1,7 +1,14 @@
-import win32com.client
-
-outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-print("--- Listing all accounts in Outlook ---")
-for folder in outlook.Folders:
-    print(f"Account Name: {folder.Name}")
+import xlwings as xw
+app = xw.App(visible=False)
+wb = app.books.open(r"...\config.xlsx", read_only=True)
+raw = wb.sheets["MMR(LOB)_EPM_INFO"].used_range.value
+headers = raw[0]
+print("=== headers (逐個 repr，睇冒號/空格) ===")
+for i, h in enumerate(headers):
+    print(i, repr(h))          # 睇實邊個係 'cnb_product'、邊個係 'cnb_product:'、有無 trailing space
+print()
+# 印每個 product 相關 column 嘅 row2 值
+for i, h in enumerate(headers):
+    if h and "product" in str(h).lower():
+        print(f"col {i}  header={h!r}  row2={raw[1][i]!r}")
+app.quit()
